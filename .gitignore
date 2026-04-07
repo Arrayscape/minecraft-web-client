@@ -20,5 +20,5 @@ storybook-static
 server-jar
 config.local.json
 logs/
-
+.claude/
 src/react/npmReactComponents.ts
