@@ -16,6 +16,7 @@ export default ({
   actionsSlot = null as React.ReactNode | null,
   showReconnect = false,
   onReconnect = undefined as undefined | (() => void),
+  hideResetApp = false,
   children
 }) => {
   const [loadingDotIndex, setLoadingDotIndex] = useState(0)
@@ -76,7 +77,7 @@ export default ({
               <b>Reconnect</b>
             </Button>}
             {actionsSlot}
-            {!lockConnect && <Button
+            {!lockConnect && !hideResetApp && <Button
               onClick={() => {
                 if (location.search) {
                   location.search = ''

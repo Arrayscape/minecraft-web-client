@@ -959,6 +959,14 @@ document.body.addEventListener('touchstart', (e) => {
 // can be deployed behind a reverse proxy that exposes /api/play/* on the
 // same host without any extra config.
 
+const magicLinkBackToMainMenu = () => {
+  // Clear the path so a reload from the main menu doesn't drop the
+  // player back into the failing magic-link flow.
+  window.history.replaceState({}, '', '/')
+  resetAppStatusState()
+  hideModal({ reactType: 'app-status' }, {}, { force: true })
+}
+
 const showMagicLinkError = (
   code: string,
   title: string,
@@ -970,6 +978,13 @@ const showMagicLinkError = (
   appStatusState.customActions = retryable
     ? [{ label: 'Try again', action: () => { handleMagicLinkPath(code) } }]
     : []
+  // Hide the generic "Reset App" button — "Try again" already retries
+  // without a full reload, and a full reload would just re-run the same
+  // failing path.
+  appStatusState.hideResetApp = true
+  // Back drops the player on the main menu AND clears /play/{code} from
+  // the URL bar so a subsequent reload starts fresh.
+  appStatusState.customBackAction = magicLinkBackToMainMenu
 }
 
 const handleMagicLinkPath = (code: string) => {
@@ -990,13 +1005,13 @@ const handleMagicLinkPath = (code: string) => {
     } catch (err) {
       // fetch() rejects with TypeError for both network failures and
       // CORS rejections; the browser deliberately won't tell us which.
-      // Surface the URL so the operator can see whether the request
-      // even pointed at the right backend.
-      console.error('Magic link redeem failed (network/CORS):', err)
+      // The URL + raw error go to the console for the operator; the
+      // player sees a bland message.
+      console.error('Magic link redeem failed (network/CORS):', url, err)
       showMagicLinkError(
         code,
-        "Couldn't reach the magic-link backend",
-        `URL: ${url}\nReason: ${err}\n\nThis usually means the backend is unreachable, the URL is wrong, or CORS isn't configured for this origin.`,
+        'Magic link server unreachable',
+        'Please try again in a moment.',
       )
       return
     }

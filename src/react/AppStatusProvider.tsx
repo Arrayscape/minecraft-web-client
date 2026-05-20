@@ -34,7 +34,16 @@ const initialState = {
   // with the rest of the state on resetAppStatusState(). Use this when a
   // feature wants a context-specific action (e.g. magic-link "Try again")
   // instead of relying on the generic Reset/Back labels.
-  customActions: [] as Array<{ label: string, action: () => void }>
+  customActions: [] as Array<{ label: string, action: () => void }>,
+  // Hide the generic "Reset App (recommended)" full-reload button — for
+  // contexts where a hard reload is duplicative of customActions and
+  // would just re-run the same failing path.
+  hideResetApp: false,
+  // Replace the default Back-button behavior. The default hides the
+  // modal (or, after a disconnect, also returns to the main menu).
+  // Useful when the feature needs to clean up route state (e.g.
+  // replaceState back to '/') before handing off.
+  customBackAction: null as (() => void) | null
 }
 export const appStatusState = proxy(initialState)
 export const resetAppStatusState = () => {
@@ -83,7 +92,7 @@ export default () => {
   }
 
   const usingState = (isOpen ? currentState : lastState.current) as typeof currentState
-  const { isError, lastStatus, maybeRecoverable, status, hideDots, descriptionHint, loadingChunksData, loadingChunksDataPlayerChunk, minecraftJsonMessage, showReconnect, customActions } = usingState
+  const { isError, lastStatus, maybeRecoverable, status, hideDots, descriptionHint, loadingChunksData, loadingChunksDataPlayerChunk, minecraftJsonMessage, showReconnect, customActions, hideResetApp, customBackAction } = usingState
 
   useDidUpdateEffect(() => {
     // todo play effect only when world successfully loaded
@@ -157,7 +166,9 @@ export default () => {
   const lockConnect = appQueryParams.lockConnect === 'true'
   const wasDisconnected = showReconnect
   let backAction = undefined as (() => void) | undefined
-  if (maybeRecoverable && (!lockConnect || !wasDisconnected)) {
+  if (customBackAction) {
+    backAction = customBackAction
+  } else if (maybeRecoverable && (!lockConnect || !wasDisconnected)) {
     backAction = () => {
       if (!wasDisconnected) {
         hideModal(undefined, undefined, { force: true })
@@ -191,6 +202,7 @@ export default () => {
         minecraftJsonMessage && <MessageFormattedString message={minecraftJsonMessage} />
       }</>}
       backAction={backAction}
+      hideResetApp={hideResetApp}
       actionsSlot={
         <>
           {customActions.map(({ label, action }) => <Button key={label} label={label} onClick={action} />)}
