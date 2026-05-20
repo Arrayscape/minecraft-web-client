@@ -1003,19 +1003,6 @@ const handleMagicLinkPath = (code: string) => {
 }
 
 const maybeEnterGame = () => {
-  // Magic-link entry: nginx serves /index.html for /play/{code} URLs and
-  // internally rewrites asset paths back to root so the SPA loads cleanly.
-  // The URL the user sees stays /play/{code}.
-  const playMatch = window.location.pathname.match(/^\/play\/([^/]+)\/?$/)
-  if (playMatch) {
-    // Normalize: strip whitespace and dashes added for display formats like
-    // "123-456" or "123 456". mc-frontend treats the {code} param as opaque
-    // so all normalization happens here.
-    const code = playMatch[1].replace(/[\s-]/g, '')
-    handleMagicLinkPath(code)
-    return
-  }
-
   const waitForConfigFsLoad = (fn: () => void) => {
     let unsubscribe: () => void | undefined
     const checkDone = () => {
@@ -1032,6 +1019,17 @@ const maybeEnterGame = () => {
       setLoadingScreenStatus(text)
       unsubscribe = subscribe(miscUiState, checkDone)
     }
+  }
+
+  // Magic-link entry: nginx serves /index.html for /play/{code} URLs and
+  // internally rewrites asset paths back to root so the SPA loads cleanly.
+  // The URL the user sees stays /play/{code}. Wait for appConfig so
+  // magicLinkBackend is available before fetching /redeem.
+  const playMatch = window.location.pathname.match(/^\/play\/([^/]+)\/?$/)
+  if (playMatch) {
+    const code = playMatch[1].replace(/[\s-]/g, '')
+    waitForConfigFsLoad(() => handleMagicLinkPath(code))
+    return
   }
 
   const reconnectOptions = sessionStorage.getItem('reconnectOptions') ? JSON.parse(sessionStorage.getItem('reconnectOptions')!) : undefined

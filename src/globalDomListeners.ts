@@ -5,7 +5,7 @@ import { isInRealGameSession } from './utils'
 
 window.addEventListener('unload', (e) => {
   if (!window.justReloaded) {
-    sessionStorage.justReloaded = false
+    sessionStorage.removeItem('justReloaded')
   }
   void saveServer()
 })
@@ -19,7 +19,7 @@ document.addEventListener('blur', () => {
 
 window.addEventListener('beforeunload', (event) => {
   if (!window.justReloaded) {
-    sessionStorage.justReloaded = false
+    sessionStorage.removeItem('justReloaded')
   }
 
   // todo-low maybe exclude chat?

@@ -48,12 +48,16 @@ const refreshApp = async (failedUpdate = false) => {
     if (!isMainMenu()) return
 
     if (failedUpdate) {
-      sessionStorage.justReloaded = false
+      // sessionStorage values are always strings — `= false` stores the
+      // string "false" which is truthy on read and would trap the version
+      // check (line ~98) in an endless refreshApp loop. Remove it so the
+      // next page load reads `null` (falsy) and breaks out.
+      sessionStorage.removeItem('justReloaded')
       // try to force bypass cache
       location.search = '?update=true'
     } else {
       window.justReloaded = true
-      sessionStorage.justReloaded = true
+      sessionStorage.justReloaded = 'true'
       window.location.reload()
     }
   } catch (err) {
