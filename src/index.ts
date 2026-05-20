@@ -76,6 +76,7 @@ import { saveToBrowserMemory } from './react/PauseScreen'
 import './devReload'
 import './water'
 import { ConnectOptions, getVersionAutoSelect, downloadOtherGameData, downloadAllMinecraftData, loadMinecraftData } from './connect'
+import { magicLinkMode } from './magicLinkMode'
 import { ref, subscribe } from 'valtio'
 import { signInMessageState } from './react/SignInMessageProvider'
 import { findServerPassword, updateAuthenticatedAccountData, updateLoadedServerData, updateServerConnectionHistory } from './react/serversStorage'
@@ -306,7 +307,17 @@ export async function connect (connectOptions: ConnectOptions) {
 
   if (connectOptions.server && !connectOptions.viewerWsConnect && !parsedServer.isWebSocket) {
     console.log(`using proxy ${proxy.host}:${proxy.port || location.port}`)
-    net['setProxy']({ hostname: proxy.host, port: proxy.port, headers: { Authorization: `Bearer ${new URLSearchParams(location.search).get('token') ?? ''}` }, artificialDelay: appQueryParams.addPing ? Number(appQueryParams.addPing) : undefined })
+    const proxyHeaders: Record<string, string> = {
+      Authorization: `Bearer ${new URLSearchParams(location.search).get('token') ?? ''}`,
+    }
+    // Magic-link mode: pass the server-side session id via header so /connect
+    // can bind the new TCP connection to the MagicSession. net-browserify's
+    // body is fixed to {host, port}, so we ride on a custom header.
+    const magicState = magicLinkMode.get()
+    if (magicState?.proxySessionId) {
+      proxyHeaders['X-Proxy-Session-Id'] = magicState.proxySessionId
+    }
+    net['setProxy']({ hostname: proxy.host, port: proxy.port, headers: proxyHeaders, artificialDelay: appQueryParams.addPing ? Number(appQueryParams.addPing) : undefined })
   }
 
   const renderDistance = singleplayer ? renderDistanceSingleplayer : multiplayerRenderDistance
@@ -552,7 +563,10 @@ export async function connect (connectOptions: ConnectOptions) {
               })
             })
           ])
-          if (signInMessageState.shouldSaveToken) {
+          // Magic-link mode: never persist tokens to localStorage. The whole
+          // point is that the browser is stateless once the tab closes; there's
+          // also nothing to save (no live/xbl/mca were ever in the browser).
+          if (signInMessageState.shouldSaveToken && !magicLinkMode.isActive()) {
             updateAuthenticatedAccountData(accounts => {
               const existingAccount = accounts.find(a => a.username === client.username)
               if (existingAccount) {
@@ -932,7 +946,76 @@ document.body.addEventListener('touchstart', (e) => {
 // #endregion
 
 // immediate game enter actions: reconnect or URL QS
+// Magic-link mode entry: a /play/{code} URL loads this SPA. We look up
+// display metadata via the backend's CORS-allowed /redeem endpoint (no
+// tokens cross this boundary; tokens live entirely on the proxy↔backend
+// link), populate magicLinkMode, then hand off to the normal connect()
+// flow which will trigger the auth + connect path with magicLinkMode-aware
+// request bodies. See src/magicLinkMode.ts and the proxy's /api/mcproxy/*
+// handlers.
+//
+// The backend host is configured per-deployment via AppConfig.magicLinkBackend
+// (see appConfig.ts). When unset, we fall back to same-origin so the SPA
+// can be deployed behind a reverse proxy that exposes /api/play/* on the
+// same host without any extra config.
+
+const handleMagicLinkPath = (code: string) => {
+  // Clear the path so a reload doesn't keep retrying (and so the URL bar
+  // doesn't show /play/{code} once we've handed off to the normal flow).
+  window.history.replaceState({}, '', '/')
+
+  void (async () => {
+    try {
+      const backendBase = miscUiState.appConfig?.magicLinkBackend ?? window.location.origin
+      const resp = await fetch(`${backendBase}/api/play/${encodeURIComponent(code)}/redeem`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      })
+      if (!resp.ok) {
+        alert(resp.status === 404
+          ? 'This magic link is invalid, expired, or revoked.'
+          : `Could not redeem magic link (HTTP ${resp.status}).`)
+        return
+      }
+      const data = await resp.json() as { BatchName: string; Gamertag: string; Servers: any[]; ExpiresAt: string }
+      const server0 = data.Servers?.[0]
+      if (!server0) {
+        alert('This magic link has no servers configured. Tell the event host.')
+        return
+      }
+      magicLinkMode.set({
+        code,
+        username: data.Gamertag,
+        servers: data.Servers,
+        expiresAt: data.ExpiresAt,
+      })
+      void connect({
+        server: `${server0.Host}:${server0.Port}`,
+        proxy: server0.ProxyURL,
+        username: data.Gamertag,
+        authenticatedAccount: true, // triggers microsoftAuthflow.ts → magic-link branch
+      })
+    } catch (err) {
+      console.error('Magic link redeem failed:', err)
+      alert(`Couldn't reach the magic-link server: ${err}`)
+    }
+  })()
+}
+
 const maybeEnterGame = () => {
+  // Magic-link entry: nginx serves /index.html for /play/{code} URLs and
+  // internally rewrites asset paths back to root so the SPA loads cleanly.
+  // The URL the user sees stays /play/{code}.
+  const playMatch = window.location.pathname.match(/^\/play\/([^/]+)\/?$/)
+  if (playMatch) {
+    // Normalize: strip whitespace and dashes added for display formats like
+    // "123-456" or "123 456". mc-frontend treats the {code} param as opaque
+    // so all normalization happens here.
+    const code = playMatch[1].replace(/[\s-]/g, '')
+    handleMagicLinkPath(code)
+    return
+  }
+
   const waitForConfigFsLoad = (fn: () => void) => {
     let unsubscribe: () => void | undefined
     const checkDone = () => {

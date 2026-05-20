@@ -1,3 +1,5 @@
+import { magicLinkMode } from './magicLinkMode'
+
 export const getProxyDetails = async (proxyBaseUrl: string) => {
   if (!proxyBaseUrl.startsWith('http')) proxyBaseUrl = `${isPageSecure() ? 'https' : 'http'}://${proxyBaseUrl}`
   const url = `${proxyBaseUrl}/api/vm/net/connect`
@@ -33,17 +35,36 @@ export default async ({ tokenCaches, proxyBaseUrl, setProgressText = (text) => {
       setProgressText('Authenticating with Microsoft account')
       if (!window.crypto && !isPageSecure()) throw new Error('Crypto API is available only in secure contexts. Be sure to use https!')
       let result = null
+
+      // Magic-link mode: send only the code. The proxy fetches the player's
+      // tokens from mc-frontend via its shared bearer secret and runs the
+      // xblive flow server-side — the browser never sees live/xbl/mca tokens
+      // or the MC access token. The streamed response includes proxySessionId
+      // (no `token` field); we capture it on magicLinkMode and synthesize a
+      // `"magic:" + proxySessionId` token for mineflayer/yggdrasil so it
+      // ends up as accessToken on the session.join wire (where the proxy's
+      // /session handler detects the sentinel prefix and looks up the cached
+      // real token).
+      const inMagicMode = magicLinkMode.isActive()
+      const requestBody = inMagicMode
+        ? {
+            magicCode: magicLinkMode.get()!.code,
+            connectingServer,
+            connectingServerVersion: connectingVersion,
+          }
+        : {
+            ...tokenCaches,
+            // important to set this param and not fake it as auth server might reject the request otherwise
+            connectingServer,
+            connectingServerVersion: connectingVersion,
+          }
+
       await fetch(authEndpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          ...tokenCaches,
-          // important to set this param and not fake it as auth server might reject the request otherwise
-          connectingServer,
-          connectingServerVersion: connectingVersion
-        }),
+        body: JSON.stringify(requestBody),
       })
         .catch(e => {
           throw new Error(`Failed to connect to auth server (network error): ${e.message}`)
@@ -67,6 +88,18 @@ export default async ({ tokenCaches, proxyBaseUrl, setProgressText = (text) => {
               onMsaCodeCallback(json)
             }
             if (json.error) throw new Error(`Auth server error: ${json.error}`)
+            // Magic-link completion: the proxy returns proxySessionId instead
+            // of a `token` field (the MC access token never leaks to the
+            // browser). Stash the session id on magicLinkMode and synthesize a
+            // sentinel token so the rest of the mineflayer/yggdrasil pipeline
+            // ends up sending it as accessToken on session.join — the proxy
+            // recognizes the "magic:" prefix and substitutes the cached real
+            // token before forwarding to Mojang.
+            if (json.proxySessionId) {
+              magicLinkMode.setProxySessionId(json.proxySessionId)
+              result = { ...json, token: 'magic:' + json.proxySessionId }
+              return
+            }
             if (json.token) result = json
             if (json.newCache) setCacheResult(json.newCache)
           }

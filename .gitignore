@@ -23,3 +23,7 @@ logs/
 .claude/
 src/react/npmReactComponents.ts
 .*.swp
+secrets/
+*.zip
+.antigravitycli/
+pkg.tmp/

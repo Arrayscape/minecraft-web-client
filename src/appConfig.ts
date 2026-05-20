@@ -56,6 +56,12 @@ export type AppConfig = {
   showModsButton?: boolean
   defaultUsername?: string
   skinTexturesProxy?: string
+  // Magic-link feature: base URL of the backend that serves
+  // /api/play/{code}/redeem. Per-deployment; left empty disables magic-link
+  // mode (a /play/{code} URL will show an error). Most deployments either
+  // set this to the backend's public hostname or reverse-proxy /api/play/*
+  // on the SPA's own origin and leave this empty (same-origin fetch).
+  magicLinkBackend?: string
   alwaysReconnectButton?: boolean
   reportBugButtonWithReconnect?: boolean
   disabledCommands?: string[] // Array of command IDs to disable (e.g. ['general.jump', 'general.chat'])
