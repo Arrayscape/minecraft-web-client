@@ -63,7 +63,7 @@ import { onAppLoad, resourcepackReload, resourcePackState } from './resourcePack
 import { ConnectPeerOptions, connectToPeer } from './localServerMultiplayer'
 import CustomChannelClient from './customClient'
 import { registerServiceWorker } from './serviceWorker'
-import { appStatusState, lastConnectOptions, quickDevReconnect } from './react/AppStatusProvider'
+import { appStatusState, lastConnectOptions, quickDevReconnect, resetAppStatusState } from './react/AppStatusProvider'
 
 import { fsState } from './loadSave'
 import { watchFov } from './rendererUtils'
@@ -959,46 +959,104 @@ document.body.addEventListener('touchstart', (e) => {
 // can be deployed behind a reverse proxy that exposes /api/play/* on the
 // same host without any extra config.
 
+const showMagicLinkError = (
+  code: string,
+  title: string,
+  description: string,
+  { retryable = true }: { retryable?: boolean } = {}
+) => {
+  setLoadingScreenStatus(title, true)
+  appStatusState.descriptionHint = description
+  appStatusState.customActions = retryable
+    ? [{ label: 'Try again', action: () => { handleMagicLinkPath(code) } }]
+    : []
+}
+
 const handleMagicLinkPath = (code: string) => {
-  // Clear the path so a reload doesn't keep retrying (and so the URL bar
-  // doesn't show /play/{code} once we've handed off to the normal flow).
-  window.history.replaceState({}, '', '/')
+  // Clear any prior error state so a "Try again" click presents a clean
+  // loading screen while the next redeem is in flight.
+  resetAppStatusState()
+  setLoadingScreenStatus('Redeeming magic link…')
 
   void (async () => {
+    const backendBase = miscUiState.appConfig?.magicLinkBackend ?? window.location.origin
+    const url = `${backendBase}/api/play/${encodeURIComponent(code)}/redeem`
+    let resp: Response
     try {
-      const backendBase = miscUiState.appConfig?.magicLinkBackend ?? window.location.origin
-      const resp = await fetch(`${backendBase}/api/play/${encodeURIComponent(code)}/redeem`, {
+      resp = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
       })
-      if (!resp.ok) {
-        alert(resp.status === 404
-          ? 'This magic link is invalid, expired, or revoked.'
-          : `Could not redeem magic link (HTTP ${resp.status}).`)
-        return
-      }
-      const data = await resp.json() as { BatchName: string; Gamertag: string; Servers: any[]; ExpiresAt: string }
-      const server0 = data.Servers?.[0]
-      if (!server0) {
-        alert('This magic link has no servers configured. Tell the event host.')
-        return
-      }
-      magicLinkMode.set({
-        code,
-        username: data.Gamertag,
-        servers: data.Servers,
-        expiresAt: data.ExpiresAt,
-      })
-      void connect({
-        server: `${server0.Host}:${server0.Port}`,
-        proxy: server0.ProxyURL,
-        username: data.Gamertag,
-        authenticatedAccount: true, // triggers microsoftAuthflow.ts → magic-link branch
-      })
     } catch (err) {
-      console.error('Magic link redeem failed:', err)
-      alert(`Couldn't reach the magic-link server: ${err}`)
+      // fetch() rejects with TypeError for both network failures and
+      // CORS rejections; the browser deliberately won't tell us which.
+      // Surface the URL so the operator can see whether the request
+      // even pointed at the right backend.
+      console.error('Magic link redeem failed (network/CORS):', err)
+      showMagicLinkError(
+        code,
+        "Couldn't reach the magic-link backend",
+        `URL: ${url}\nReason: ${err}\n\nThis usually means the backend is unreachable, the URL is wrong, or CORS isn't configured for this origin.`,
+      )
+      return
     }
+    if (!resp.ok) {
+      if (resp.status === 404) {
+        showMagicLinkError(
+          code,
+          'Magic link not valid',
+          'This link is invalid, expired, or has been revoked. Ask the event host for a fresh one.',
+          { retryable: false },
+        )
+      } else {
+        showMagicLinkError(
+          code,
+          `Redeem failed (HTTP ${resp.status})`,
+          `The magic-link backend returned an unexpected error.`,
+        )
+      }
+      return
+    }
+    let data: { BatchName: string; Gamertag: string; Servers: any[]; ExpiresAt: string }
+    try {
+      data = await resp.json()
+    } catch (err) {
+      console.error('Magic link redeem returned non-JSON:', err)
+      showMagicLinkError(
+        code,
+        'Unexpected response from the magic-link backend',
+        `The backend returned a non-JSON response. (${err})`,
+      )
+      return
+    }
+    const server0 = data.Servers?.[0]
+    if (!server0) {
+      showMagicLinkError(
+        code,
+        'No servers configured for this link',
+        'Tell the event host — the batch this link belongs to has no servers attached.',
+        { retryable: false },
+      )
+      return
+    }
+    magicLinkMode.set({
+      code,
+      username: data.Gamertag,
+      servers: data.Servers,
+      expiresAt: data.ExpiresAt,
+    })
+    // Clear the path now that the handoff is happening — keeping it through
+    // the failure paths above means the operator can hit reload to retry
+    // instead of having to retype the URL.
+    window.history.replaceState({}, '', '/')
+    // Clear the redeeming-status screen before connect() drives its own.
+    setLoadingScreenStatus(undefined)
+    void connect({
+      server: `${server0.Host}:${server0.Port}`,
+      proxy: server0.ProxyURL,
+      username: data.Gamertag,
+      authenticatedAccount: true, // triggers microsoftAuthflow.ts → magic-link branch
+    })
   })()
 }
 

@@ -28,7 +28,13 @@ const initialState = {
   loadingChunksDataPlayerChunk: null as null | { x: number, z: number },
   isDisplaying: false,
   minecraftJsonMessage: null as null | Record<string, any>,
-  showReconnect: false
+  showReconnect: false,
+  // Caller-supplied buttons rendered into the AppStatus actionsSlot in
+  // addition to the default ones (Reset App, Back, etc). Cleared along
+  // with the rest of the state on resetAppStatusState(). Use this when a
+  // feature wants a context-specific action (e.g. magic-link "Try again")
+  // instead of relying on the generic Reset/Back labels.
+  customActions: [] as Array<{ label: string, action: () => void }>
 }
 export const appStatusState = proxy(initialState)
 export const resetAppStatusState = () => {
@@ -77,7 +83,7 @@ export default () => {
   }
 
   const usingState = (isOpen ? currentState : lastState.current) as typeof currentState
-  const { isError, lastStatus, maybeRecoverable, status, hideDots, descriptionHint, loadingChunksData, loadingChunksDataPlayerChunk, minecraftJsonMessage, showReconnect } = usingState
+  const { isError, lastStatus, maybeRecoverable, status, hideDots, descriptionHint, loadingChunksData, loadingChunksDataPlayerChunk, minecraftJsonMessage, showReconnect, customActions } = usingState
 
   useDidUpdateEffect(() => {
     // todo play effect only when world successfully loaded
@@ -187,6 +193,7 @@ export default () => {
       backAction={backAction}
       actionsSlot={
         <>
+          {customActions.map(({ label, action }) => <Button key={label} label={label} onClick={action} />)}
           {displayAuthButton && <Button label='Authenticate' onClick={authReconnectAction} />}
           {displayVpnButton && <PossiblyVpnBypassProxyButton reconnect={quickDevReconnect} />}
           {replayActive && <Button label={`Download Packets Replay ${replayLogger?.contents.split('\n').length}L`} onClick={downloadPacketsReplay} />}
