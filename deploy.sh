@@ -5,10 +5,8 @@
 # root after unzipping.
 #
 # Usage:
-#   scp mwc-<tag>.zip vm:
-#   ssh vm
-#   mkdir /tmp/mwc-deploy && cd /tmp/mwc-deploy
-#   unzip ~/mwc-<tag>.zip
+#   unzip mwc-<tag>.zip      # creates mwc-<tag>/
+#   cd mwc-<tag>
 #   sudo ./deploy.sh
 #
 # What it does:
@@ -51,7 +49,8 @@ if [[ ! -f nginx-mc.conf ]]; then
 fi
 
 VAR_WWW=/var/www/mwc
-NGINX_CONF=/etc/nginx/sites-enabled/mc.conf
+NGINX_AVAILABLE=/etc/nginx/sites-available/mc.conf
+NGINX_ENABLED=/etc/nginx/sites-enabled/mc.conf
 SPA_LINK="$VAR_WWW/mwc"
 SPA_LINK_TMP="$VAR_WWW/mwc.new"
 
@@ -85,26 +84,48 @@ fi
 echo "Installing SPA tree to $target ..."
 cp -r "$mwc_dir" "$target"
 
-# Validate the new nginx config against the current system before swapping
-# anything live. nginx -t reads /etc/nginx/* in its current state, so we
-# put the new config into place first but defer the symlink swap and
-# reload until validation passes. If validation fails we restore the old
-# nginx config from a backup.
+# Install the new config to sites-available/, then make sure the
+# sites-enabled/ symlink points at it. Debian/Ubuntu nginx convention:
+# the real file lives in sites-available, sites-enabled is just symlinks
+# for the currently-active subset.
+#
+# Order matters: install to sites-available BEFORE creating/refreshing
+# the symlink, so `nginx -t` always sees a consistent state. If
+# validation fails, restore the previous available file from backup.
 nginx_backup=""
-if [[ -f "$NGINX_CONF" ]]; then
-    nginx_backup="$NGINX_CONF.bak.$(date +%s)"
-    cp "$NGINX_CONF" "$nginx_backup"
+if [[ -f "$NGINX_AVAILABLE" ]]; then
+    nginx_backup="$NGINX_AVAILABLE.bak.$(date +%s)"
+    cp "$NGINX_AVAILABLE" "$nginx_backup"
 fi
 
-echo "Installing nginx config to $NGINX_CONF ..."
-cp nginx-mc.conf "$NGINX_CONF"
+mkdir -p "$(dirname "$NGINX_AVAILABLE")" "$(dirname "$NGINX_ENABLED")"
+
+echo "Installing nginx config to $NGINX_AVAILABLE ..."
+cp nginx-mc.conf "$NGINX_AVAILABLE"
+
+# Refuse to clobber an existing non-symlink at sites-enabled — that's
+# probably a hand-edited deployment that someone will be unhappy to lose.
+if [[ -e "$NGINX_ENABLED" && ! -L "$NGINX_ENABLED" ]]; then
+    echo "Error: $NGINX_ENABLED exists and is not a symlink. Move it aside before deploying:" >&2
+    echo "       sudo mv $NGINX_ENABLED $NGINX_ENABLED.preexisting" >&2
+    if [[ -n "$nginx_backup" && -f "$nginx_backup" ]]; then
+        cp "$nginx_backup" "$NGINX_AVAILABLE"
+    fi
+    exit 1
+fi
+
+echo "Linking $NGINX_ENABLED -> $NGINX_AVAILABLE ..."
+ln -snf "$NGINX_AVAILABLE" "$NGINX_ENABLED"
 
 echo "Validating nginx config ..."
 if ! nginx -t; then
-    echo "Error: nginx -t failed for the new config; rolling back nginx config" >&2
+    echo "Error: nginx -t failed for the new config; rolling back" >&2
     if [[ -n "$nginx_backup" && -f "$nginx_backup" ]]; then
-        cp "$nginx_backup" "$NGINX_CONF"
+        cp "$nginx_backup" "$NGINX_AVAILABLE"
     fi
+    # The symlink either already pointed at the available file or now does;
+    # since we restored the available file's contents, the symlink target
+    # is back to the previous state automatically.
     echo "       (SPA symlink left unchanged; previous version still serving)" >&2
     exit 1
 fi
