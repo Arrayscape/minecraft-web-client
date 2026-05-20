@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import { openURL } from 'renderer/viewer/lib/simpleUtils'
 import { useSnapshot } from 'valtio'
 import { haveDirectoryPicker } from '../utils'
@@ -15,6 +15,7 @@ import {
 import styles from './mainMenu.module.css'
 import Button from './Button'
 import ButtonWithTooltip from './ButtonWithTooltip'
+import Input from './Input'
 import { pixelartIcons } from './PixelartIcon'
 import useLongPress from './useLongPress'
 import PauseLinkButtons from './PauseLinkButtons'
@@ -135,6 +136,18 @@ export default ({
     { delay: 500 }
   )
 
+  const [magicCode, setMagicCode] = useState('')
+  // Magic-link redeem: same effect as visiting /play/{code} directly.
+  // We pushState to /play/{code} first so the URL bar reflects the magic
+  // mode and a reload re-runs the flow; index.ts owns the actual fetch
+  // via the 'magic-redeem' event listener.
+  const submitMagicCode = () => {
+    const normalized = magicCode.replace(/[\s-]/g, '')
+    if (!normalized) return
+    window.history.pushState({}, '', `/play/${encodeURIComponent(normalized)}`)
+    dispatchEvent(new CustomEvent('magic-redeem', { detail: { code: normalized } }))
+  }
+
   return (
     <div className={styles.root}>
       <div className={styles['game-title']}>
@@ -155,6 +168,24 @@ export default ({
         >
           Connect to server
         </ButtonWithTooltip>
+        <div className={styles['menu-row']}>
+          <Input
+            value={magicCode}
+            placeholder='Magic code'
+            onChange={e => setMagicCode((e.target as HTMLInputElement).value)}
+            onKeyDown={e => { if (e.key === 'Enter') submitMagicCode() }}
+            rootStyles={{ flex: 1 }}
+            data-test-id='magic-code-input'
+          />
+          <Button
+            onClick={submitMagicCode}
+            disabled={!magicCode.replace(/[\s-]/g, '')}
+            style={{ width: 50 }}
+            data-test-id='magic-code-redeem'
+          >
+            Play
+          </Button>
+        </div>
         <div style={{ display: 'flex', justifyContent: 'space-between' }}>
           <ButtonWithTooltip
             style={{ width: 150 }}

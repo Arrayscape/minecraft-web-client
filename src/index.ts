@@ -149,6 +149,14 @@ function listenGlobalEvents () {
     const { connectOptions, ...rest } = detail
     loadSingleplayer(rest, {}, connectOptions)
   })
+  // Magic-link redeem entry from the main-menu input. Same event-driven
+  // pattern as 'connect' / 'singleplayer' above so the UI component
+  // doesn't need to import index.ts (would be a cycle).
+  window.addEventListener('magic-redeem', (e) => {
+    const code = (e as CustomEvent).detail?.code as string | undefined
+    if (!code) return
+    handleMagicLinkPath(code)
+  })
 }
 
 export async function connect (connectOptions: ConnectOptions) {
