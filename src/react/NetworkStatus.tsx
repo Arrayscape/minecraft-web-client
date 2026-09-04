@@ -42,10 +42,11 @@ export default () => {
       }
 
       const updateProxyPing = async () => {
-        if (!isWebSocket) {
-          const ping = await bot.pingProxy()
-          setProxyPingWithTimeout(ping)
-        }
+        if (isWebSocket) return
+        const ping = await bot.pingProxy()
+        // A negative result means the proxy did not answer in time. Leave the
+        // previous value to go stale rather than rendering a bogus number.
+        if (ping >= 0) setProxyPingWithTimeout(ping)
       }
 
       try {
