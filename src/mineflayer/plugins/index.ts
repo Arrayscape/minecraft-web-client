@@ -1,5 +1,5 @@
 import { lastConnectOptions } from '../../react/AppStatusProvider'
-import { patchOutboundQueue } from '../socketOutboundQueue'
+import { patchResumableSocket } from '../resumableSocket'
 import mouse from './mouse'
 import packetsPatcher from './packetsPatcher'
 import { localRelayServerPlugin } from './packetsRecording'
@@ -9,9 +9,10 @@ import webFeatures from './webFeatures'
 // register
 webFeatures()
 packetsPatcher()
-// Must run before any socket exists: it patches Socket.prototype so that packets
-// written while the connection is down are held rather than silently discarded.
-patchOutboundQueue()
+// Must run before any socket exists: it patches Socket.prototype so the Duplex —
+// and with it the cipher state, the splitter's partial frame, and the world
+// model — survives losing the WebSocket underneath it.
+patchResumableSocket()
 
 
 customEvents.on('mineflayerBotCreated', () => {

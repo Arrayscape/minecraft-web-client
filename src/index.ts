@@ -18,6 +18,7 @@ import './mineflayer/plugins'
 import './app/progressControllers'
 import './app/gamepadCursor'
 import { getServerInfo } from './mineflayer/mc-protocol'
+import { resumeEvents } from './mineflayer/resumableSocket'
 import { onGameLoad } from './inventoryWindows'
 import initCollisionShapes from './getCollisionInteractionShapes'
 import protocolMicrosoftAuth from 'minecraft-protocol/src/client/microsoftAuth'
@@ -647,21 +648,36 @@ export async function connect (connectOptions: ConnectOptions) {
         }
         bot._client.socket.on('connect', () => {
           console.log('Proxy WebSocket connection established')
-          //@ts-expect-error
-          bot._client.socket._ws.addEventListener('close', () => {
-            console.log('WebSocket connection closed')
-            setTimeout(() => {
-              if (bot) {
-                bot.emit('end', 'WebSocket connection closed with unknown reason')
-              }
-            }, 1000)
-          })
-          bot._client.socket.on('close', () => {
-            setTimeout(() => {
-              if (bot) {
-                bot.emit('end', 'WebSocket connection closed with unknown reason')
-              }
-            })
+
+          // Losing the WebSocket is no longer the end of the session. The socket
+          // reconnects underneath the Duplex and the byte stream continues, so
+          // the protocol stack above — cipher position, half-read frame, world
+          // model — is never told anything happened. Ending the bot here would
+          // destroy exactly the state the resume depends on.
+          //
+          // The HUD needs nothing extra: gameAdditionalState.noConnection already
+          // turns on after two seconds without a packet (mc-protocol.ts), which
+          // is precisely an outage.
+          const onLost = () => {
+            console.log('Proxy WebSocket lost; resuming')
+          }
+          const onResumed = (e: Event) => {
+            const { detail } = e as CustomEvent
+            console.log(`Proxy WebSocket resumed (replayed ${detail?.replayed ?? 0} bytes)`)
+          }
+          // The one case that really is terminal: the stream can no longer be
+          // resumed honestly, so continuing would corrupt it.
+          const onUnresumable = (e: Event) => {
+            const { detail } = e as CustomEvent
+            if (bot) bot.emit('end', `Connection lost and could not be resumed: ${detail?.reason ?? 'unknown'}`)
+          }
+          resumeEvents.addEventListener('lost', onLost)
+          resumeEvents.addEventListener('resumed', onResumed)
+          resumeEvents.addEventListener('unresumable', onUnresumable)
+          errorAbortController.signal.addEventListener('abort', () => {
+            resumeEvents.removeEventListener('lost', onLost)
+            resumeEvents.removeEventListener('resumed', onResumed)
+            resumeEvents.removeEventListener('unresumable', onUnresumable)
           })
         })
       }
