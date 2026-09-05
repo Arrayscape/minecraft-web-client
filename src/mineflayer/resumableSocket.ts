@@ -231,8 +231,16 @@ const reconnect = async (socket: any, state: ResumeState) => {
     // eslint-disable-next-line no-await-in-loop -- as above
     await waitForOnline()
 
+    // State how much we already have, in the URL, so the proxy knows before it
+    // sends anything. It replays everything unconfirmed the moment a transport
+    // attaches; were our true count to arrive afterwards, the replay would start
+    // from a stale acknowledgement and resend bytes we already had. A duplicate
+    // corrupts the byte stream exactly as a gap does, and just as silently.
+    const received: number = socket.bytesRead ?? 0
+    const url = `${socket._resumeUrl}&received=${received}`
+
     // eslint-disable-next-line no-await-in-loop -- as above
-    const ws = await openSocket(socket._resumeUrl)
+    const ws = await openSocket(url)
     if (!ws) continue
 
     socket._ws = ws
