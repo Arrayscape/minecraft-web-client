@@ -74,6 +74,8 @@ class FakeProxy {
   control: string[] = []
   /** Whether to answer the client's `resume:` with our own, as a peer does. */
   announceOnResume = true
+  /** When set, every new connection is closed with this code, as a dead session is. */
+  refuseWith: number | null = null
   /** The offset each connection opened with, in order. */
   resumedFrom: number[] = []
   /** Control frames, kept per connection so their order can be asserted. */
@@ -82,6 +84,10 @@ class FakeProxy {
   constructor () {
     this.server = new WebSocketServer({ port: 0 })
     this.server.on('connection', (ws: any, req: any) => {
+      if (this.refuseWith !== null) {
+        ws.close(this.refuseWith, 'no such session')
+        return
+      }
       this.urls.push(req.url ?? '')
       this.sockets.push(ws)
       const control: string[] = []
@@ -493,6 +499,49 @@ describe('resumableSocket', () => {
 
     // The answer re-arms it, or a session that filled once would never ask again.
     await waitFor('the answer', () => !st.ackAsked, 2000)
+  })
+
+  it('gives up at once when the proxy says the session is gone', async () => {
+    // A rejected upgrade tells a browser nothing — 1006, the same thing an
+    // unreachable proxy looks like — so without a close code the client would
+    // retry a dead session until its own window expired, and the player would
+    // sit watching a game that had already ended.
+    const socket = await connect()
+    const gone: any[] = []
+    resumeEvents.addEventListener('unresumable', e => gone.push((e as CustomEvent).detail))
+
+    // Every future connection is refused the way a torn-down session is.
+    proxy.refuseWith = 4004
+    proxy.kill()
+
+    const startedAt = Date.now()
+    await waitFor('the client to stop', () => gone.length > 0, 5000)
+
+    // Promptly, and with the proxy's own words — not after the resume window.
+    expect(Date.now() - startedAt).toBeLessThan(5000)
+    expect(gone.at(-1).reason).toMatch(/no such session/)
+    expect(state(socket).broken).toBe(true)
+
+    // The proxy completes the upgrade and then closes, so this arrives through
+    // the transport's close handler rather than as a failed dial. Both routes
+    // reach the same place; this is the one production takes, because a close
+    // code is the only thing a browser can read.
+    expect(state(socket).attached).toBe(false)
+  })
+
+  it('keeps retrying when the proxy is merely unreachable', async () => {
+    // The other half of the same decision: a dial that fails without a reason
+    // is a network problem, and the session may still be there.
+    const socket = await connect()
+    const gone: any[] = []
+    resumeEvents.addEventListener('unresumable', e => gone.push((e as CustomEvent).detail))
+
+    proxy.close() // nothing listening at all
+    await wait(1500)
+
+    expect(gone.length).toBe(0)
+    expect(state(socket).broken).toBe(false)
+    expect(state(socket).attempts).toBeGreaterThan(1)
   })
 
   it('survives repeated drops', async () => {

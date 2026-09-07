@@ -69,6 +69,24 @@ const RESUME_WINDOW_MS = 60_000
  */
 const PEER_LEFT_CODES = new Set([1000, 1001, 1005])
 
+/**
+ * Close codes the proxy uses to say a session cannot be resumed.
+ *
+ * These exist because a browser learns nothing from a rejected upgrade — no
+ * status, no body, and a 1006 that means "the connection failed", which is
+ * exactly what an unreachable proxy looks like. Without them a client whose
+ * session had been torn down would retry until its own window expired, leaving
+ * the player watching a game that had already ended.
+ *
+ * 4003 (busy) is deliberately not here: the previous transport has not released
+ * the session yet, and the next attempt is expected to work.
+ */
+const TERMINAL_CODES = new Map<number, string>([
+  [4004, 'the session no longer exists'],
+  [4001, 'the proxy refused to resume from our position'],
+  [4002, 'the proxy rejected our resume handshake'],
+])
+
 export interface ResumeState {
   /**
    * The window over what we are sending. Head, cursor and produced, with the
@@ -418,6 +436,12 @@ const attachTransport = (socket: any, ws: WebSocket, state: ResumeState, initial
     if (socket._ws !== ws) return // already replaced
     state.attached = false
 
+    const terminal = TERMINAL_CODES.get(e?.code)
+    if (terminal) {
+      giveUp(socket, state, e?.reason || terminal)
+      return
+    }
+
     const peerLeft = PEER_LEFT_CODES.has(e?.code)
     // Read before destroying: destroy() is patched to set `closing`, so asking
     // afterwards always says the close was ours.
@@ -532,8 +556,19 @@ const reconnect = async (socket: any, state: ResumeState) => {
     await waitForOnline()
 
     // eslint-disable-next-line no-await-in-loop -- as above
-    const ws = await openSocket(socket._resumeUrl)
-    if (!ws) continue
+    const dialled = await openSocket(socket._resumeUrl)
+    if (!(dialled instanceof WebSocket)) {
+      // Retrying is only worth it if there is something to come back to. When
+      // the proxy has said there is not, say so now rather than after the
+      // window expires: the player is waiting to be told.
+      const terminal = TERMINAL_CODES.get(dialled.code)
+      if (terminal) {
+        giveUp(socket, state, dialled.reason || terminal)
+        break
+      }
+      continue
+    }
+    const ws = dialled
 
     socket._ws = ws
     // Not attached until the proxy says where it is: sending from our own
@@ -554,26 +589,30 @@ const reconnect = async (socket: any, state: ResumeState) => {
   state.reconnecting = false
 }
 
-const openSocket = async (url: string): Promise<WebSocket | null> => new Promise(resolve => {
+/** A dial that failed, and what the far end said about it. */
+interface DialFailure { code: number, reason: string }
+
+const openSocket = async (url: string): Promise<WebSocket | DialFailure> => new Promise(resolve => {
   let ws: WebSocket
   try {
     ws = new WebSocket(url)
   } catch {
-    resolve(null)
+    resolve({ code: 0, reason: 'the socket could not be created' })
     return
   }
-  const settle = (value: WebSocket | null) => {
+
+  const settle = (value: WebSocket | DialFailure) => {
     ws.removeEventListener('open', onOpen)
     ws.removeEventListener('error', onError)
     ws.removeEventListener('close', onClose)
     resolve(value)
   }
   const onOpen = () => settle(ws)
-  const onError = () => settle(null)
+  const onError = () => settle({ code: 0, reason: 'the socket could not be opened' })
   // A socket refused before it opens closes without ever erroring in some
-  // browsers; without this the dial would never settle and the resume would
-  // stall on an attempt that already failed.
-  const onClose = () => settle(null)
+  // browsers, and the close carries the only explanation there is going to be.
+  const onClose = (e: any) => settle({ code: e?.code ?? 0, reason: e?.reason ?? '' })
+
   ws.addEventListener('open', onOpen)
   ws.addEventListener('error', onError)
   ws.addEventListener('close', onClose)

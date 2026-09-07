@@ -45,6 +45,31 @@ const START_AT = process.env.START_AT ?? ''
 // so a client that never sends one stalls as soon as the server has produced
 // StreamBufferBytes of output.
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS ?? 5000)
+/**
+ * What the world does behind the player's back while the link is down.
+ *
+ * The queued movement measured by the plain run is movement the server would
+ * have accepted anyway. These are the cases where it could not have happened:
+ * the ground the player walked over is now a wall, or the player was dead the
+ * whole time. What the server does with a burst of impossible movement is the
+ * question — accept, correct, or disconnect.
+ *
+ *   none      the plain run
+ *   wall      a barrier is built across the path mid-outage
+ *   death     the player is killed mid-outage
+ *   teleport  the player is moved somewhere else mid-outage
+ *   all       one outage of each, in that order
+ */
+const CONFLICT = process.env.CONFLICT ?? 'none'
+/**
+ * How long the player walks during an outage, as opposed to how long the outage
+ * lasts.
+ *
+ * They are separate because the flat area is finite: walk for a whole long
+ * outage and the probe leaves it, falls, and the fall shows up as a correction
+ * that has nothing to do with what the server made of the movement burst.
+ */
+const WALK_MS = Number(process.env.WALK_MS ?? 2000)
 const OUTAGES = Number(process.env.OUTAGES ?? 3)
 const OUTAGE_MS = Number(process.env.OUTAGE_MS ?? 4000)
 // A last, longer outage aimed near the proxy's resume deadline. Zero skips it.
@@ -91,9 +116,20 @@ class Cutter {
   server: net.Server
   pairs = new Set<[net.Socket, net.Socket]>()
   cuts = 0
+  /** Whether the route exists at all. While false, dialling it fails. */
+  private routed = true
 
   constructor (private readonly toPort: number, private readonly listenPort: number) {
     this.server = net.createServer(client => {
+      // A severed link is not one that reconnects on the next attempt. Cutting
+      // live connections while still accepting new ones makes every outage last
+      // exactly one reconnect backoff, whatever the test asked for — which is
+      // how an early version of this harness reported twenty-second outages
+      // that were really two hundred and fifty milliseconds.
+      if (!this.routed) {
+        client.destroy()
+        return
+      }
       const upstream = net.connect(this.toPort, '127.0.0.1')
       const pair: [net.Socket, net.Socket] = [client, upstream]
       this.pairs.add(pair)
@@ -117,6 +153,17 @@ class Cutter {
     await new Promise<void>(resolve => {
       this.server.listen(this.listenPort, '127.0.0.1', () => resolve())
     })
+  }
+
+  /** Take the route away: cut what is live and refuse what tries to come back. */
+  down () {
+    this.routed = false
+    return this.cut()
+  }
+
+  /** Put it back. */
+  up () {
+    this.routed = true
   }
 
   cut () {
@@ -189,6 +236,14 @@ const main = async () => {
   const pongs: string[] = []
   const probe = mineflayer.createBot({
     host: MC_HOST, port: MC_PORT, username: PROBE, auth: 'offline', version: VERSION,
+    // What the web client sets (src/index.ts:606). Not a detail: minecraft-
+    // protocol's own watchdog ends the session when no keep-alive has arrived
+    // for this long, and during an outage none can — they are queued in the
+    // proxy. At the 30 s default a twenty-second outage kills the session from
+    // the client side before the resume ever completes, and the failure looks
+    // like a server kick when it is nothing of the kind.
+    checkTimeoutInterval: 240 * 1000,
+    closeTimeout: 240 * 1000,
     connect: (client: any) => {
       const socket = new browserNet.Socket()
       probeSocket = socket
@@ -231,6 +286,16 @@ const main = async () => {
   const heardByProbe: string[] = []
   probe.on('chat', (_username: string, message: string) => { heardByProbe.push(message) })
 
+  const deaths: string[] = []
+  probe.on('death', () => { deaths.push(new Date().toISOString()) })
+  // Server-forced repositioning. This is what a rejected movement burst looks
+  // like from the client's side: the server says where the player actually is.
+  const forcedMoves: number[] = []
+  probe._client.on('position', (packet: any) => {
+    const at = probe.entity?.position
+    if (at) forcedMoves.push(Math.hypot(packet.x - at.x, packet.y - at.y, packet.z - at.z))
+  })
+
   await spawned(probe, 'probe')
   log(`probe     ${PROBE} joined through the proxy at ${probe.entity.position}`)
   try {
@@ -248,6 +313,9 @@ const main = async () => {
     await sleep(1500)
   }
   probe.chat(`/tp ${WITNESS} ${PROBE}`)
+  // The witness needs to be able to change the world while the probe is away.
+  // The probe is opped, and an opped player can op another.
+  probe.chat(`/op ${WITNESS}`)
   await sleep(1500)
 
   // A teleport streams a whole new region, which with compression on is a lot of
@@ -266,7 +334,13 @@ const main = async () => {
 
   resumeEvents.addEventListener('lost', () => log('  [client] transport lost'))
   resumeEvents.addEventListener('resumed', (e: any) => log(`  [client] resumed (replayed ${e.detail?.replayed ?? 0} bytes)`))
-  resumeEvents.addEventListener('unresumable', (e: any) => log(`  [client] UNRESUMABLE: ${e.detail?.reason}`))
+  let lostAt: number | undefined
+  let gaveUpAfterMs: number | undefined
+  resumeEvents.addEventListener('lost', () => { lostAt ??= Date.now() })
+  resumeEvents.addEventListener('unresumable', (e: any) => {
+    gaveUpAfterMs = lostAt === undefined ? undefined : Date.now() - lostAt
+    log(`  [client] UNRESUMABLE after ${gaveUpAfterMs}ms: ${e.detail?.reason}`)
+  })
 
   // Sanity, both directions: an assertion about an outage means nothing unless
   // the same assertion holds when nothing is wrong.
@@ -283,8 +357,43 @@ const main = async () => {
     throw new Error('the two bots cannot hear each other with nothing broken; nothing below would mean anything')
   }
 
+  /**
+   * Which way there is ground to walk on.
+   *
+   * Facing a compass point and hoping is how the first attempt at the wall test
+   * placed a barrier in mid-air off the edge of the plain: the probe walked over
+   * the edge before it ever reached the wall, and the run reported no conflict
+   * because there had not been one.
+   */
+  const pickOpenDirection = () => {
+    const at = probe.entity.position
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]]
+    let best = { dx: 1, dz: 0, run: 0 }
+
+    for (const [dx, dz] of dirs) {
+      let run = 0
+      for (let d = 1; d <= 30; d++) {
+        const under = probe.blockAt(at.offset(dx * d, -1, dz * d))
+        const head = probe.blockAt(at.offset(dx * d, 0, dz * d))
+        if (!under || under.boundingBox !== 'block') break
+        if (head && head.boundingBox === 'block') break
+        run = d
+      }
+      if (run > best.run) best = { dx, dz, run }
+    }
+    return best
+  }
+
+  const heading = pickOpenDirection()
+  log(`terrain   ${heading.run} blocks of open ground toward (${heading.dx}, ${heading.dz})`)
+  const faceForward = async () => {
+    const at = probe.entity.position
+    await probe.lookAt(at.offset(heading.dx * 20, 0, heading.dz * 20))
+  }
+
   // Does the bot move at all? If terrain has it wedged, a displacement of zero
   // after an outage would mean nothing.
+  await faceForward()
   probe.setControlState('forward', true)
   const walkFrom = probeAt()
   await sleep(2000)
@@ -303,16 +412,69 @@ const main = async () => {
 
   const results: Array<{
     n: number, outbound: boolean, inbound: boolean, resumes: number, ended: boolean, moved: number,
-    correction: number
+    correction: number, conflict: string, died: number, forced: number, health: number
   }> = []
 
-  const total = OUTAGES + (LONG_OUTAGE_MS > 0 ? 1 : 0)
+  /**
+   * Make the queued movement impossible, from the witness, while the probe is
+   * disconnected.
+   *
+   * Note what the probe does *not* see: the block update, the death, the
+   * teleport are all sitting in the proxy's buffer for the whole outage. Its
+   * local physics walks on in ignorance and queues movement for ground that is
+   * now a wall. Both the world change and the movement land at once on resume,
+   * which is exactly the collision this is testing.
+   */
+  const applyConflict = async (kind: string, from: any, now: any) => {
+    switch (kind) {
+      case 'wall': {
+        // Across the path rather than at a compass point: the direction comes
+        // from where the probe has actually walked, so this does not depend on
+        // which way any yaw convention points.
+        const dx = now.x - from.x
+        const dz = now.z - from.z
+        const len = Math.hypot(dx, dz) || 1
+        const ahead = 4
+        const cx = Math.round(now.x + (dx / len) * ahead)
+        const cz = Math.round(now.z + (dz / len) * ahead)
+        const y = Math.round(now.y)
+        // Perpendicular to the direction of travel, so it spans the path.
+        const px = Math.round(-(dz / len) * 4)
+        const pz = Math.round((dx / len) * 4)
+        observer.chat(`/fill ${cx - px} ${y} ${cz - pz} ${cx + px} ${y + 3} ${cz + pz} stone`)
+        log(`  [world] wall across the path at (${cx}, ${y}, ${cz}), ${ahead} blocks ahead`)
+        break
+      }
+      case 'death': {
+        observer.chat(`/kill ${PROBE}`)
+        log('  [world] the probe was killed')
+        break
+      }
+      case 'teleport': {
+        const x = Math.round(from.x) + 40
+        observer.chat(`/tp ${PROBE} ${x} ${Math.round(from.y)} ${Math.round(from.z)}`)
+        log(`  [world] the probe was moved to x=${x}`)
+        break
+      }
+      default:
+        break
+    }
+    await sleep(500)
+  }
+
+  const conflicts = CONFLICT === 'all' ? ['wall', 'death', 'teleport'] : [CONFLICT]
+  const total = CONFLICT === 'none'
+    ? OUTAGES + (LONG_OUTAGE_MS > 0 ? 1 : 0)
+    : conflicts.length
   for (let n = 1; n <= total; n++) {
-    const long = n > OUTAGES
+    const long = CONFLICT === 'none' && n > OUTAGES
     const holdMs = long ? LONG_OUTAGE_MS : OUTAGE_MS
+    const conflict = CONFLICT === 'none' ? 'none' : conflicts[n - 1]
     const outbound = `probe-during-outage-${n}`
     const inbound = `witness-during-outage-${n}`
     const before = getResumeState(probeSocket)?.resumes ?? 0
+    const deathsBefore = deaths.length
+    const forcedBefore = forcedMoves.length
 
     // Back to the same spot each time. Five seconds of walking covers enough
     // ground to leave the flat area, and an outage that starts with the probe
@@ -324,23 +486,45 @@ const main = async () => {
     }
     const from = probeAt()
 
-    const severed = cutter.cut()
-    log(`\noutage ${n}  severed ${severed} connection(s), holding ${holdMs}ms`)
+    const severed = cutter.down()
+    log(`\noutage ${n}  severed ${severed} connection(s), route down for ${holdMs}ms`)
 
     // The player keeps playing. This is the requirement: not a fast rejoin, but
     // a session that never stopped.
+    await faceForward()
     probe.setControlState('forward', true)
     probe.chat(outbound)
     observer.chat(inbound)
 
-    await sleep(holdMs)
+    const walkMs = Math.min(WALK_MS, holdMs)
+    if (conflict !== 'none') {
+      await sleep(Math.min(800, walkMs / 2))
+      await applyConflict(conflict, from ?? probe.entity.position, probe.entity.position)
+      await sleep(Math.max(0, walkMs - 800))
+    } else {
+      await sleep(walkMs)
+    }
+
     probe.setControlState('forward', false)
+    await sleep(200) // let the local physics settle before reading the claim
+
     // Where the client believes it walked to. Nothing has confirmed it: these
-    // are the packets sitting in the queue.
+    // are the packets sitting in the queue, and this is the position the server
+    // will either accept or correct.
     const claimed = probe.entity.position.clone()
+    log(`  walked ${walkMs}ms while disconnected, to ${claimed}`)
+
+    // The rest of the outage, standing still.
+    await sleep(Math.max(0, holdMs - walkMs))
+
+    // The route comes back. The client is somewhere in its backoff, so the
+    // reconnect lands up to one backoff interval later — which is what happens
+    // at a venue too.
+    cutter.up()
+    log(`  route restored after ${holdMs}ms; waiting for the client to notice`)
 
     // Wait for the shim to get back.
-    const deadline = Date.now() + 20_000
+    const deadline = Date.now() + 30_000
     while ((getResumeState(probeSocket)?.resumes ?? 0) === before && Date.now() < deadline) {
       await sleep(100)
     }
@@ -359,23 +543,35 @@ const main = async () => {
       // walked. A queued burst the server rejects comes back as a correction,
       // and this is what that correction would measure.
       correction: to ? claimed.distanceTo(to) : Number.NaN,
+      conflict,
+      died: deaths.length - deathsBefore,
+      // Server-forced repositions during and after the burst: the shape a
+      // rejection takes when it is not a disconnection.
+      forced: forcedMoves.length - forcedBefore,
+      health: probe.health,
     })
     const r = results.at(-1)!
-    log(`outage ${n}  resumes=${r.resumes} outbound=${r.outbound} inbound=${r.inbound} ` +
-      `moved=${r.moved.toFixed(2)} correction=${r.correction.toFixed(2)} ended=${r.ended}`)
+    log(`outage ${n}  conflict=${r.conflict} resumes=${r.resumes} outbound=${r.outbound} inbound=${r.inbound} ` +
+      `moved=${r.moved.toFixed(2)} correction=${r.correction.toFixed(2)} forced=${r.forced} ` +
+      `died=${r.died} health=${r.health} ended=${r.ended}`)
     if (r.ended) break
   }
 
   log('\n--- result ---')
   // A movement queued through an outage has to actually take effect: delivered
   // but rejected is not the same as delivered.
+  // In a conflict run the movement is supposed to be impossible, so distance
+  // proves nothing and only survival does: the session must not end, and the
+  // stream must still be carrying traffic in both directions afterwards.
   const MOVED_ENOUGH = 1 // blocks; anything less is standing still
-  const ok = results.every(r => r.outbound && r.inbound && !r.ended && r.moved >= MOVED_ENOUGH) &&
-    probeEnded.length === 0
+  const ok = CONFLICT === 'none'
+    ? results.every(r => r.outbound && r.inbound && !r.ended && r.moved >= MOVED_ENOUGH) && probeEnded.length === 0
+    : results.every(r => !r.ended) && probeEnded.length === 0
   for (const r of results) {
-    log(`outage ${r.n}: outbound ${r.outbound ? 'delivered' : 'LOST'}, inbound ${r.inbound ? 'replayed' : 'LOST'}, ` +
-      `the server moved the player ${r.moved.toFixed(2)} blocks and corrected it by ${r.correction.toFixed(2)}, ` +
-      `session ${r.ended ? 'ENDED' : 'alive'}`)
+    log(`outage ${r.n} [${r.conflict}]: outbound ${r.outbound ? 'delivered' : 'LOST'}, ` +
+      `inbound ${r.inbound ? 'replayed' : 'LOST'}, the server moved the player ${r.moved.toFixed(2)} blocks, ` +
+      `corrected it by ${r.correction.toFixed(2)} over ${r.forced} forced move(s), ` +
+      `${r.died} death(s), health ${r.health}, session ${r.ended ? 'ENDED' : 'alive'}`)
   }
   log(`probe position after ${OUTAGES} outages: ${probe.entity?.position}`)
   log(`probe heard:   ${JSON.stringify(heardByProbe)}`)
@@ -384,6 +580,7 @@ const main = async () => {
   log(`client window: acked=${st?.out.acked} cursor=${st?.out.position} produced=${st?.out.produced} held=${st?.out.length}`)
   log(`pongs seen by the client: ${pongs.length}${pongs.length ? ` (last ${pongs.at(-1)})` : ''}`)
   log(`session end events: ${probeEnded.length === 0 ? 'none' : probeEnded.join(' | ')}`)
+  log(`unresumable after: ${gaveUpAfterMs === undefined ? 'n/a' : `${gaveUpAfterMs}ms`}`)
   log(ok ? '\nPASS — the session survived every outage in both directions' : '\nFAIL')
 
   probe.quit()
