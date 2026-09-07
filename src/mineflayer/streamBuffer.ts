@@ -24,6 +24,8 @@
 // the session. Full means backpressure on one side and death on the other;
 // everything downstream of `write` is identical.
 
+import { ChunkedBytes } from './chunkedBytes'
+
 /** Why a stated position was refused. Mirrors the proxy's two sentinels. */
 export type StreamPositionFault =
   /** The peer claims bytes that were never sent to it. */
@@ -39,11 +41,10 @@ export class StreamPositionError extends Error {
 }
 
 export class StreamBuffer {
-  /** Retained bytes, oldest first. The first begins at `headOffset`. */
-  private chunks: Buffer[] = []
+  /** The bytes themselves. This type owns only the three positions into them. */
+  private readonly bytes = new ChunkedBytes()
   private headOffset = 0
   private cursorOffset = 0
-  private held = 0
 
   constructor (readonly capacity: number) {}
 
@@ -54,10 +55,10 @@ export class StreamBuffer {
   get position () { return this.cursorOffset }
 
   /** Everything ever written to the stream. */
-  get produced () { return this.headOffset + this.held }
+  get produced () { return this.headOffset + this.bytes.length }
 
   /** How many bytes are held — written, not yet released. */
-  get length () { return this.held }
+  get length () { return this.bytes.length }
 
   /** How many bytes are waiting at the cursor, written but not yet taken. */
   get unsent () { return this.produced - this.cursorOffset }
@@ -71,10 +72,9 @@ export class StreamBuffer {
    */
   write (buf: Buffer): boolean {
     if (buf.length === 0) return true
-    if (this.held + buf.length > this.capacity) return false
+    if (this.bytes.length + buf.length > this.capacity) return false
 
-    this.chunks.push(buf)
-    this.held += buf.length
+    this.bytes.append(buf)
     return true
   }
 
@@ -86,28 +86,14 @@ export class StreamBuffer {
    * because until then it is what a resync would have to replay.
    */
   next (max = Number.MAX_SAFE_INTEGER): Buffer | null {
-    const available = this.produced - this.cursorOffset
-    if (available <= 0 || max <= 0) return null
+    // Read at the cursor, not at the head. The two differ by whatever is in
+    // flight — handed out, not yet acknowledged — and the store is asked for
+    // the offset directly, exactly as the proxy asks its ring.
+    const out = this.bytes.peekAt(this.cursorOffset - this.headOffset, max)
+    if (!out) return null
 
-    const want = Math.min(available, max)
-    const out: Buffer[] = []
-    let skip = this.cursorOffset - this.headOffset
-    let taken = 0
-
-    for (const chunk of this.chunks) {
-      if (skip >= chunk.length) {
-        skip -= chunk.length
-        continue
-      }
-      const slice = chunk.subarray(skip, Math.min(chunk.length, skip + (want - taken)))
-      skip = 0
-      out.push(slice)
-      taken += slice.length
-      if (taken === want) break
-    }
-
-    this.cursorOffset += taken
-    return out.length === 1 ? out[0] : Buffer.concat(out)
+    this.cursorOffset += out.length
+    return out
   }
 
   /**
@@ -150,20 +136,7 @@ export class StreamBuffer {
 
   /** Drop retained bytes up to an absolute offset. Callers check the bounds. */
   private release (offset: number) {
-    let drop = offset - this.headOffset
-
-    while (drop > 0 && this.chunks.length > 0) {
-      const head = this.chunks[0]
-      if (head.length <= drop) {
-        drop -= head.length
-        this.held -= head.length
-        this.chunks.shift()
-      } else {
-        this.chunks[0] = head.subarray(drop)
-        this.held -= drop
-        drop = 0
-      }
-    }
+    this.bytes.release(offset - this.headOffset)
     this.headOffset = offset
   }
 }

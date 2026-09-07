@@ -12,7 +12,8 @@ export default defineConfig({
       'sign-renderer/tests.test.ts',
       '../../src/utils.test.ts',
       '../../src/mineflayer/resumableSocket.test.ts',
-      '../../src/mineflayer/streamBuffer.test.ts'
+      '../../src/mineflayer/streamBuffer.test.ts',
+      '../../src/mineflayer/chunkedBytes.test.ts'
     ],
   },
 })
