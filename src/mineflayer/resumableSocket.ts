@@ -231,6 +231,19 @@ const installPongHandler = (socket: any) => {
  * resumed transport must do neither — the protocol stack above already believes
  * it is connected, and re-announcing would have it redo a handshake mid-session.
  */
+/**
+ * Tell the proxy where we are in its stream, before it sends anything.
+ *
+ * Every connection states it, the first one included, where it is zero. The
+ * proxy has no safe value to assume in its place: resuming from the last
+ * acknowledgement would replay everything since — bytes we already hold — and a
+ * duplicate corrupts the byte stream exactly as thoroughly as a gap. Nothing on
+ * this side would catch it, because `bytesRead` is a count, not a filter.
+ */
+const sendResumeOffset = (socket: any, ws: WebSocket) => {
+  ws.send(`resume:${socket.bytesRead ?? 0}`)
+}
+
 const attachTransport = (socket: any, ws: WebSocket, state: ResumeState, initial: boolean) => {
   // Deliver binary frames synchronously. Asking for Blobs (the default) means
   // reading each one through a FileReader, so delivery becomes asynchronous per
@@ -256,6 +269,9 @@ const attachTransport = (socket: any, ws: WebSocket, state: ResumeState, initial
       if (settled) return
       settled = true
       clearTimeout(timeout)
+
+      // Before 'connect', so nothing above can write ahead of the handshake.
+      sendResumeOffset(socket, ws)
 
       state.connected = true
       socket._connecting = false
@@ -292,6 +308,20 @@ const attachTransport = (socket: any, ws: WebSocket, state: ResumeState, initial
     if (typeof contents === 'string') {
       if (contents.startsWith('pong:')) {
         socket.emit('pong', contents.slice('pong:'.length))
+        return
+      }
+      if (contents === 'ackreq') {
+        // The proxy is asking where we are, because its buffer is filling and
+        // nothing is released until we say. It knows how full it is and we do
+        // not, so it asks and we answer immediately rather than waiting for the
+        // heartbeat — which is a timer chosen for latency reporting, not for
+        // how fast the server happens to be sending.
+        //
+        // The ordinary heartbeat frame is the answer: one way of stating a
+        // position, prompted or not.
+        try {
+          ws.send(`ping:0:${socket.bytesRead ?? 0}`)
+        } catch { /* the socket died between the request and the reply */ }
         return
       }
       if (socket.handleStringMessage(contents)) {
@@ -399,21 +429,17 @@ const reconnect = async (socket: any, state: ResumeState) => {
     // eslint-disable-next-line no-await-in-loop -- as above
     await waitForOnline()
 
-    // State how much we already have, in the URL, so the proxy knows before it
-    // sends anything. It replays everything unconfirmed the moment a transport
-    // attaches; were our true count to arrive afterwards, the replay would start
-    // from a stale acknowledgement and resend bytes we already had. A duplicate
-    // corrupts the byte stream exactly as a gap does, and just as silently.
-    const received: number = socket.bytesRead ?? 0
-    const url = `${socket._resumeUrl}&received=${received}`
-
     // eslint-disable-next-line no-await-in-loop -- as above
-    const ws = await openSocket(url)
+    const ws = await openSocket(socket._resumeUrl)
     if (!ws) continue
 
     socket._ws = ws
     attachTransport(socket, ws, state, false)
 
+    // Both positions, in order, before any data: where we are in the proxy's
+    // stream, then where our own replay begins. Nothing can interleave — this
+    // runs to completion without yielding.
+    sendResumeOffset(socket, ws)
     replay(socket, state)
 
     state.reconnecting = false
@@ -456,12 +482,26 @@ const openSocket = async (url: string): Promise<WebSocket | null> => new Promise
  * Resend everything the proxy has not confirmed.
  *
  * Whether those bytes were actually lost is unknowable from here — only the
- * proxy knows what arrived — so everything unconfirmed goes again and the
- * proxy's own count sorts it out. Resending what it already has would duplicate
- * bytes in the stream, which is why it discards below its receive count rather
- * than trusting ours.
+ * proxy knows what arrived — so everything unconfirmed goes again, prefixed by
+ * where the replay starts so the proxy can drop what it already has.
+ *
+ * That prefix is not optional. Our idea of what the proxy accepted comes from
+ * its pong replies and is always behind the truth: everything sent since the
+ * last one has to be assumed lost. So the replay necessarily overlaps what the
+ * proxy already forwarded to Minecraft, and a duplicated byte range corrupts
+ * that stream exactly as thoroughly as a gap — the server reads a bogus packet
+ * length and closes the connection.
+ *
+ * Live writes cannot overtake it: the caller attaches, hands over both offsets
+ * and replays without yielding, so nothing else runs in between.
  */
 const replay = (socket: any, state: ResumeState) => {
+  try {
+    socket._ws.send(`sent:${state.proxyRx}`)
+  } catch {
+    return // the new socket died before the replay began
+  }
+
   const pending = [...state.pending]
   for (const chunk of pending) {
     try {
