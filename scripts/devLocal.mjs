@@ -38,7 +38,15 @@ const USERNAME = process.env.USERNAME_OVERRIDE ?? 'DevPlayer'
 //
 // Supplying `ip` switches the screen to its Connect button, which runs
 // onQsConnect instead and has no such guard.
-const CLIENT_URL = `${CLIENT_ORIGIN}/?ip=${MC_HOST}&proxy=${PROXY_URL}&username=${USERNAME}`
+// Magic-code mode wants the main menu, where the redeem input lives. Any ?ip=
+// goes straight past it to the connect screen — which is why MAGIC=1 opens the
+// bare origin. Nothing else is passed either: in that mode the client takes the
+// server AND the proxy from what mc-frontend returns for the code, so ?proxy=
+// would be ignored anyway (index.ts:1094).
+const MAGIC = !!process.env.MAGIC
+const CLIENT_URL = MAGIC
+  ? `${CLIENT_ORIGIN}/`
+  : `${CLIENT_ORIGIN}/?ip=${MC_HOST}&proxy=${PROXY_URL}&username=${USERNAME}`
 
 const banner = (lines) => {
   const width = Math.max(...lines.map(l => l.length)) + 4
@@ -78,13 +86,32 @@ const main = async () => {
   const proxyUp = await checkProxy()
 
   banner([
-    `client   ${CLIENT_URL}`,
-    `proxy    ${PROXY_URL}   ${proxyUp ? '[up]' : '[NOT RESPONDING]'}`,
-    ...(proxyUp ? [] : ['', 'Start the proxy first:  cd ../MWCProxy && make run']),
+    `client   ${CLIENT_URL}${MAGIC ? '   (main menu — enter the magic code there)' : ''}`,
+    `proxy    ${PROXY_URL}   ${proxyUp ? '[up]' : '[NOT RESPONDING]'}${MAGIC ? '   (ignored in magic mode)' : ''}`,
+    ...(proxyUp
+      ? []
+      : ['', PROXY_URL.includes('localhost') || PROXY_URL.includes('127.0.0.1')
+          ? 'Start the proxy first:  cd ../MWCProxy && make run'
+          : `No answer from ${PROXY_URL}/health — check the host, port and TLS.`]),
     '',
     'If rsbuild reports a port other than ' + CLIENT_PORT + ', rerun with PORT=<that port>.',
     '',
-    'Click Connect on the screen that opens. Do not use Save — on a URL',
+    ...(MAGIC ? [
+      'Magic mode. Two things have to be set up, and neither is ?proxy=:',
+      '',
+      '  1. config.local.json needs {"magicLinkBackend": "https://..."} —',
+      '     rsbuild merges it over config.json at startup, so restart after',
+      '     creating it. Without it the redeem is fetched from this page\'s',
+      '     own origin and comes back as HTML, which the client reports as',
+      '     "Unexpected response from the magic-link backend".',
+      '',
+      '  2. The backend must return a ProxyURL for the batch pointing at the',
+      '     proxy you mean to test. The client connects through that, not',
+      '     through anything set here.',
+      '',
+      'The redeem URL and the raw failure are logged to the browser console.',
+    ] : [
+      'Click Connect on the screen that opens. Do not use Save — on a URL',
     'with query params it is a no-op (index.ts:1159 opens the modal without',
     'setting serverEditScreen, so onConfirm returns early).',
     '',
@@ -92,8 +119,13 @@ const main = async () => {
     'its own origin, not MWCProxy. The port field is ignored; the proxy',
     'uses MWC_PROXY_MC_PORT.',
     '',
-    'The Minecraft server needs online-mode=false: with no auth flow the',
-    'client refuses to join an online-mode server.',
+    'Without an auth flow the Minecraft server needs online-mode=false —',
+    'the client refuses to join an online-mode server otherwise. That does',
+    'not apply to the magic-code path, which authenticates: for that, note',
+    'the client connects through the ProxyURL mc-frontend returns for the',
+    'batch, NOT through ?proxy= (index.ts:1094), and the redeem itself goes',
+    'to appConfig.magicLinkBackend, defaulting to this page\'s own origin.',
+    ]),
   ])
 
   // Same processes as `pnpm start2` — rsbuild plus the mesher watcher, and

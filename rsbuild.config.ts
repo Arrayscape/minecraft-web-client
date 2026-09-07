@@ -178,6 +178,21 @@ const appConfig = defineConfig({
         //     name: 'assets',
         // },
         proxy: {
+            // The magic-link redeem is the one call the browser makes directly
+            // to mc-frontend. In production that is same-origin — mc-frontend
+            // serves the client — so the backend has never needed CORS, and
+            // its preflight comes back 204 with no Access-Control headers at
+            // all. A client served from anywhere else is refused by the
+            // browser, which reports it as an unreachable server.
+            //
+            // So the dev server makes the call instead: same-origin from the
+            // page's point of view, cross-origin from node's, where CORS does
+            // not apply. Must come before the '/api' rule below, which is more
+            // general and would otherwise swallow it.
+            '/api/play': {
+                target: process.env.MAGIC_LINK_BACKEND || 'https://mcplaydates.com',
+                changeOrigin: true,
+            },
             '/api': 'http://localhost:8080',
         },
     },
