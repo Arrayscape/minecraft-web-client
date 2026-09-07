@@ -138,6 +138,9 @@ class FakeProxy {
   }
 }
 
+/** Mirrors MAX_BUFFERED_BYTES in resumableSocket.ts. */
+const MAX_BUFFERED = 64 * 1024 + 1
+
 const wait = async (ms: number) => new Promise(resolve => { setTimeout(resolve, ms) })
 
 const waitFor = async (what: string, cond: () => boolean, timeout = 3000) => {
@@ -542,6 +545,53 @@ describe('resumableSocket', () => {
     expect(gone.length).toBe(0)
     expect(state(socket).broken).toBe(false)
     expect(state(socket).attempts).toBeGreaterThan(1)
+  })
+
+  it('stops feeding a send queue that is not keeping up', async () => {
+    // `WebSocket.send` never blocks and never fails on a slow link — the browser
+    // queues the bytes with no bound and no drain event. Feeding it blindly puts
+    // the same bytes in two places and hides the congestion entirely.
+    const socket = await connect()
+
+    // Pretend the browser is backed up. bufferedAmount is a getter on the
+    // prototype; this shadows it on the instance.
+    let buffered = MAX_BUFFERED
+    Object.defineProperty(socket._ws, 'bufferedAmount', { get: () => buffered, configurable: true })
+
+    socket.write(Buffer.from('held back'))
+    await wait(100)
+
+    expect(proxy.bytesReceived()).toBe(0)
+    expect(state(socket).out.unsent).toBe(9) // still ours, still in the window
+
+    // The queue drains, and the timer — not a write — is what notices.
+    buffered = 0
+    await waitFor('the pump to resume', () => proxy.bytesReceived() === 9, 2000)
+    expect(proxy.allReceived()).toBe('held back')
+  })
+
+  it('runs no timer when nothing is waiting', async () => {
+    // The wake-up exists only while it has work. A standing interval would be a
+    // permanent cost for a case that almost never happens.
+    const socket = await connect()
+    socket.write(Buffer.from('hello'))
+    await waitFor('delivery', () => proxy.bytesReceived() === 5)
+
+    expect(state(socket).pumpTimer).toBeUndefined()
+  })
+
+  it('drops the pump timer with the transport it belonged to', async () => {
+    const socket = await connect()
+
+    const buffered = MAX_BUFFERED
+    Object.defineProperty(socket._ws, 'bufferedAmount', { get: () => buffered, configurable: true })
+    socket.write(Buffer.from('stuck'))
+    await waitFor('a pending pump', () => state(socket).pumpTimer !== undefined, 2000)
+
+    getResumeState(socket)!.closing = true
+    socket._ws.close()
+    await waitFor('the timer to go', () => state(socket).pumpTimer === undefined, 2000)
+    void buffered
   })
 
   it('survives repeated drops', async () => {

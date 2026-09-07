@@ -47,6 +47,28 @@ const MAX_UNCONFIRMED_BYTES = 4 * 1024 * 1024
  */
 const ASK_FOR_ACK_BYTES = MAX_UNCONFIRMED_BYTES / 2
 
+/**
+ * How much we are willing to leave sitting in the browser's own send queue.
+ *
+ * `WebSocket.send` never blocks and never fails on a slow link: the browser
+ * copies the bytes into a queue the spec puts no bound on, with no drain event
+ * and nothing observable but `bufferedAmount`. Feeding it without looking means
+ * the cursor advances past what the transport has actually accepted, the same
+ * bytes are held twice — once in our window, once in that queue — and congestion
+ * becomes invisible.
+ *
+ * The proxy has no equivalent because Go's write blocks, so its cursor tracks
+ * what the transport took. This is how ours comes to mean the same thing.
+ *
+ * Sized so that ordinary play never reaches it — upstream is a few KB/s — while
+ * a replay after a long outage goes out in a handful of passes rather than one
+ * unbounded shove.
+ */
+const MAX_BUFFERED_BYTES = 64 * 1024
+
+/** How soon to look again while the queue is above that. */
+const PUMP_RETRY_MS = 25
+
 const RECONNECT_BASE_MS = 250
 const RECONNECT_MAX_MS = 5000
 
@@ -105,6 +127,14 @@ export interface ResumeState {
   /** Numbers our own pings; the proxy echoes it back. */
   pingSeq: number
   /**
+   * Set only while the transport is congested and bytes are waiting.
+   *
+   * There is no drain event to wait on, so this is what wakes the pump. It
+   * exists only while it has work: in ordinary operation the writes themselves
+   * drive everything and no timer is created at all.
+   */
+  pumpTimer: any
+  /**
    * Whether the window is bound to a transport.
    *
    * The same rule the proxy applies: a transport carries nothing until the
@@ -128,6 +158,7 @@ const stateOf = (socket: any): ResumeState => {
     closing: false,
     ackAsked: false,
     pingSeq: 0,
+    pumpTimer: undefined,
     attached: false,
     connected: false,
     lostAt: undefined,
@@ -229,6 +260,17 @@ const pump = (socket: any, state: ResumeState) => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return
 
   for (;;) {
+    if (state.out.unsent === 0) return
+
+    // Stop feeding a queue that is not keeping up, and leave the bytes where
+    // they are. This is the client's version of the proxy blocking in its
+    // write: the window fills, and if it fills completely the session ends —
+    // rather than the browser silently swallowing an unbounded copy of it.
+    if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
+      schedulePump(socket, state)
+      return
+    }
+
     const chunk = state.out.next()
     if (!chunk) return
     try {
@@ -239,6 +281,21 @@ const pump = (socket: any, state: ResumeState) => {
       return
     }
   }
+}
+
+/** Look again shortly. Idempotent: one pending timer at a time. */
+const schedulePump = (socket: any, state: ResumeState) => {
+  if (state.pumpTimer !== undefined) return
+  state.pumpTimer = setTimeout(() => {
+    state.pumpTimer = undefined
+    pump(socket, state)
+  }, PUMP_RETRY_MS)
+}
+
+const stopPump = (state: ResumeState) => {
+  if (state.pumpTimer === undefined) return
+  clearTimeout(state.pumpTimer)
+  state.pumpTimer = undefined
 }
 
 /**
@@ -291,6 +348,7 @@ const askForAckIfFilling = (socket: any, state: ResumeState) => {
 const giveUp = (socket: any, state: ResumeState, reason: string) => {
   if (state.broken) return
   state.broken = true
+  stopPump(state)
   console.warn(`[resume] ${reason}; this session can no longer be resumed`)
   emit('unresumable', { reason })
   if (socket?.readyState === 'open') socket.destroy()
@@ -435,6 +493,7 @@ const attachTransport = (socket: any, ws: WebSocket, state: ResumeState, initial
   ws.addEventListener('close', (e: any) => {
     if (socket._ws !== ws) return // already replaced
     state.attached = false
+    stopPump(state) // it belongs to the transport that is going away
 
     const terminal = TERMINAL_CODES.get(e?.code)
     if (terminal) {

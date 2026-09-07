@@ -59,6 +59,9 @@ export class StreamBuffer {
   /** How many bytes are held — written, not yet released. */
   get length () { return this.held }
 
+  /** How many bytes are waiting at the cursor, written but not yet taken. */
+  get unsent () { return this.produced - this.cursorOffset }
+
   /**
    * Append to the stream. Returns false if it would not fit, having written
    * nothing.
