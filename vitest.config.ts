@@ -10,7 +10,8 @@ export default defineConfig({
       '../../src/chatUtils.test.ts',
       'lib/mesher/test/tests.test.ts',
       'sign-renderer/tests.test.ts',
-      '../../src/utils.test.ts'
+      '../../src/utils.test.ts',
+      '../../src/mineflayer/resumableSocket.test.ts'
     ],
   },
 })

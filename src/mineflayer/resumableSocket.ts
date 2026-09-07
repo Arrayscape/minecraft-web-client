@@ -33,6 +33,25 @@ const MAX_UNCONFIRMED_BYTES = 4 * 1024 * 1024
 const RECONNECT_BASE_MS = 250
 const RECONNECT_MAX_MS = 5000
 
+/**
+ * How long to keep trying before admitting the session is gone.
+ *
+ * The proxy holds a detached session for its own deadline and then closes the
+ * Minecraft connection; past that there is nothing left to resume onto and every
+ * further attempt is refused. Without a bound the client would retry forever
+ * against a session that no longer exists, which to the player looks exactly
+ * like a hang.
+ */
+const RESUME_WINDOW_MS = 60_000
+
+/**
+ * Close codes that mean the peer closed deliberately rather than the network
+ * failing underneath it: normal, going-away, and no-status (a close handshake
+ * carrying no code is still a handshake). Anything else — 1006 above all — is a
+ * connection that died, which is precisely what a resume is for.
+ */
+const PEER_LEFT_CODES = new Set([1000, 1001, 1005])
+
 export interface ResumeState {
   /** Bytes handed to send(). */
   txTotal: number
@@ -48,6 +67,10 @@ export interface ResumeState {
   resumes: number
   /** Set by end()/destroy() so a deliberate close is not treated as a drop. */
   closing: boolean
+  /** Set once a transport has opened: before that, failures are connect errors. */
+  connected: boolean
+  /** When the current outage started, for the resume window. */
+  lostAt: number | undefined
 }
 
 const stateOf = (socket: any): ResumeState => {
@@ -61,6 +84,8 @@ const stateOf = (socket: any): ResumeState => {
     attempts: 0,
     resumes: 0,
     closing: false,
+    connected: false,
+    lostAt: undefined,
   } satisfies ResumeState
   return socket._resume
 }
@@ -95,8 +120,18 @@ export const patchResumableSocket = () => {
   Socket.prototype._connectWebSocket = function (token: string, cb: any) {
     const result = originalConnectWS.call(this, token, cb)
     this._resumeUrl = this._ws?.url
-    installResumeHandlers(this)
+    installPongHandler(this)
     return result
+  }
+
+  // Replaces net-browserify's version wholesale rather than wrapping it. Its
+  // handlers are written on the assumption that the socket has exactly one
+  // WebSocket for its whole life, and three of them actively fight a resume:
+  // the 'close' handler destroys the Duplex, the 'error' handler emits on it
+  // (which destroys it a level up), and the connect timeout fires ten seconds
+  // after any attach that did not come with a fresh 'open'.
+  Socket.prototype._handleWebsocket = function () {
+    attachTransport(this, this._ws, stateOf(this), true)
   }
 
   Socket.prototype._write = function (chunk: any, encoding: any, callback: any) {
@@ -139,11 +174,7 @@ const retain = (socket: any, state: ResumeState, buf: Buffer) => {
   if (state.pendingBytes + buf.length > MAX_UNCONFIRMED_BYTES) {
     // A byte stream cannot skip anything: dropping here would desync the cipher
     // on any later resume. Mark the session unresumable rather than pretend.
-    state.broken = true
-    console.warn(
-      `[resume] unconfirmed output passed ${MAX_UNCONFIRMED_BYTES} bytes; this session can no longer be resumed`
-    )
-    emit('unresumable', { reason: 'outbound buffer exceeded' })
+    giveUp(socket, state, `unconfirmed output passed ${MAX_UNCONFIRMED_BYTES} bytes`)
     return
   }
   state.pending.push(buf)
@@ -171,27 +202,156 @@ const confirmTo = (state: ResumeState, proxyRx: number) => {
   }
 }
 
-const installResumeHandlers = (socket: any) => {
-  const state = stateOf(socket)
+/** The session cannot be continued. Say so once, and let the socket close. */
+const giveUp = (socket: any, state: ResumeState, reason: string) => {
+  if (state.broken) return
+  state.broken = true
+  console.warn(`[resume] ${reason}; this session can no longer be resumed`)
+  emit('unresumable', { reason })
+  if (socket?.readyState === 'open') socket.destroy()
+}
+
+const installPongHandler = (socket: any) => {
+  if (socket._resumePong) return
+  socket._resumePong = true
 
   // The proxy reports what it has accepted in its pong. That is the only thing
   // that frees retained output.
   socket.on('pong', (payload: string) => {
     const proxyRx = Number(String(payload).split(':')[1])
-    if (Number.isFinite(proxyRx)) confirmTo(state, proxyRx)
+    if (Number.isFinite(proxyRx)) confirmTo(stateOf(socket), proxyRx)
   })
-
-  attachSocketListeners(socket, socket._ws, state)
 }
 
-const attachSocketListeners = (socket: any, ws: WebSocket, state: ResumeState) => {
-  ws.addEventListener('close', () => {
-    if (state.closing || state.broken) return
+/**
+ * Wire a WebSocket to the Duplex.
+ *
+ * `initial` marks the socket net-browserify dialled during connect(): only that
+ * one announces itself with 'connect' and is held to a connect timeout. A
+ * resumed transport must do neither — the protocol stack above already believes
+ * it is connected, and re-announcing would have it redo a handshake mid-session.
+ */
+const attachTransport = (socket: any, ws: WebSocket, state: ResumeState, initial: boolean) => {
+  // Deliver binary frames synchronously. Asking for Blobs (the default) means
+  // reading each one through a FileReader, so delivery becomes asynchronous per
+  // frame and nothing orders the completions of two frames that arrive back to
+  // back. A byte stream cannot survive reordering, and the corruption would
+  // surface far from here as a desynchronised cipher.
+  ws.binaryType = 'arraybuffer'
+
+  let settled = !initial
+  let timeout: any
+
+  if (initial) {
+    timeout = setTimeout(() => {
+      if (settled) return
+      settled = true
+      ws.close()
+      socket.emit('error', `Proxy server is reachable, but the WebSocket connection timed out after ${socket._wsTimeout / 1000} seconds. Possible reasons:
+1. Most probably the proxy server (${hostOf(ws)}) is misconfigured and not accepting WebSocket connections.
+2. Your browser or network is blocking WebSocket connections.`)
+    }, socket._wsTimeout)
+
+    ws.addEventListener('open', () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+
+      state.connected = true
+      socket._connecting = false
+      socket.readable = true
+      socket.emit('connect')
+      socket.read(0)
+    })
+  } else {
+    state.connected = true
+  }
+
+  ws.addEventListener('error', (e: any) => {
+    if (socket._ws !== ws) return
+    if (!state.connected) {
+      // Nothing ever came up, so this is a connect failure and the player needs
+      // to hear about it.
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      console.warn('TCP error', e)
+      socket.emit('error', 'An error occurred with the WebSocket connection. Please check your network connection and proxy server status.')
+      return
+    }
+    // An established transport fails by closing, and 'error' arrives first.
+    // Emitting it on the Duplex would destroy the very state the resume exists
+    // to preserve; the close handler decides what happens next.
+    if (state.closing || state.broken) return // shutting down: not worth a word
+    console.warn('[resume] transport error; waiting for close')
+  })
+
+  ws.addEventListener('message', (e: MessageEvent) => {
+    const contents = e.data
+
+    if (typeof contents === 'string') {
+      if (contents.startsWith('pong:')) {
+        socket.emit('pong', contents.slice('pong:'.length))
+        return
+      }
+      if (socket.handleStringMessage(contents)) {
+        deliver(socket, Buffer.from(contents))
+      }
+      return
+    }
+    if (contents instanceof ArrayBuffer) {
+      deliver(socket, Buffer.from(contents))
+      return
+    }
+    console.warn('Cannot read TCP stream: unsupported message type', contents)
+  })
+
+  ws.addEventListener('close', (e: any) => {
     if (socket._ws !== ws) return // already replaced
 
+    const peerLeft = PEER_LEFT_CODES.has(e?.code)
+    // Read before destroying: destroy() is patched to set `closing`, so asking
+    // afterwards always says the close was ours.
+    const endedHere = state.closing || state.broken
+    if (endedHere || peerLeft) {
+      // Deliberate on one side or the other: this is the end of the session, and
+      // the Duplex should end with it.
+      const wasOpen = socket.readyState === 'open'
+      if (wasOpen) socket.destroy()
+
+      // net-browserify's destroy only sets flags — it emits nothing — so a far
+      // end that hangs up cleanly leaves the protocol stack above waiting for a
+      // packet that will never come. minecraft-protocol ends the client on
+      // 'close'; say it, so a real disconnect reaches the player instead of the
+      // session quietly going still.
+      //
+      // Only when the other side left: a local end() or destroy() has already
+      // told everything above, and 'unresumable' carries the giving-up case.
+      if (wasOpen && peerLeft && !endedHere) socket.emit('close')
+      return
+    }
+
+    state.lostAt ??= Date.now()
     emit('lost', { attempts: state.attempts })
     void reconnect(socket, state)
   })
+}
+
+/** The proxy's host, for a connect failure the player has to act on. */
+const hostOf = (ws: WebSocket): string => {
+  try {
+    return new URL(ws.url).host
+  } catch {
+    return 'unknown host'
+  }
+}
+
+const deliver = (socket: any, buf: Buffer) => {
+  // bytesRead is what the heartbeat reports to the proxy, so it must count
+  // bytes as they are pushed: data sitting in the Duplex has been received,
+  // whether or not the decipher has consumed it yet.
+  socket.bytesRead += buf.length
+  socket.push(buf)
 }
 
 const delayFor = (attempts: number) => Math.min(RECONNECT_BASE_MS * 2 ** Math.max(0, attempts - 1), RECONNECT_MAX_MS)
@@ -202,7 +362,10 @@ const sleep = async (ms: number): Promise<void> => new Promise(resolve => {
 
 /** Wait for a network rather than burning attempts against a dead radio. */
 const waitForOnline = async (): Promise<void> => {
-  if (typeof navigator === 'undefined' || navigator.onLine) return
+  // Only an explicit false means offline. Where the browser does not report it
+  // at all, assume a network and let the dial decide.
+  const offline = typeof navigator !== 'undefined' && (navigator as any).onLine === false
+  if (!offline) return
   return new Promise<void>(resolve => {
     window.addEventListener('online', () => {
       resolve()
@@ -223,6 +386,11 @@ const reconnect = async (socket: any, state: ResumeState) => {
   state.reconnecting = true
 
   while (!state.closing && !state.broken) {
+    if (Date.now() - (state.lostAt ?? Date.now()) > RESUME_WINDOW_MS) {
+      giveUp(socket, state, `no transport for ${Math.round(RESUME_WINDOW_MS / 1000)}s`)
+      break
+    }
+
     state.attempts++
     // eslint-disable-next-line no-await-in-loop -- backoff is inherently serial
     await sleep(delayFor(state.attempts))
@@ -244,15 +412,13 @@ const reconnect = async (socket: any, state: ResumeState) => {
     if (!ws) continue
 
     socket._ws = ws
-    // net-browserify's handler pushes inbound frames into the Duplex and emits
-    // 'pong'; reusing it keeps one code path for message handling.
-    socket._handleWebsocket()
-    attachSocketListeners(socket, ws, state)
+    attachTransport(socket, ws, state, false)
 
     replay(socket, state)
 
     state.reconnecting = false
     state.attempts = 0
+    state.lostAt = undefined
     state.resumes++
     emit('resumed', { resumes: state.resumes, replayed: state.pendingBytes })
     return
@@ -272,12 +438,18 @@ const openSocket = async (url: string): Promise<WebSocket | null> => new Promise
   const settle = (value: WebSocket | null) => {
     ws.removeEventListener('open', onOpen)
     ws.removeEventListener('error', onError)
+    ws.removeEventListener('close', onClose)
     resolve(value)
   }
   const onOpen = () => settle(ws)
   const onError = () => settle(null)
+  // A socket refused before it opens closes without ever erroring in some
+  // browsers; without this the dial would never settle and the resume would
+  // stall on an attempt that already failed.
+  const onClose = () => settle(null)
   ws.addEventListener('open', onOpen)
   ws.addEventListener('error', onError)
+  ws.addEventListener('close', onClose)
 })
 
 /**
