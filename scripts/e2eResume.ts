@@ -381,7 +381,7 @@ const main = async () => {
   log(`probe heard:   ${JSON.stringify(heardByProbe)}`)
   log(`witness heard: ${JSON.stringify(heardByObserver)}`)
   const st = getResumeState(probeSocket)
-  log(`client retention: txTotal=${st?.txTotal} proxyRx=${st?.proxyRx} pending=${st?.pendingBytes}`)
+  log(`client window: acked=${st?.out.acked} cursor=${st?.out.position} produced=${st?.out.produced} held=${st?.out.length}`)
   log(`pongs seen by the client: ${pongs.length}${pongs.length ? ` (last ${pongs.at(-1)})` : ''}`)
   log(`session end events: ${probeEnded.length === 0 ? 'none' : probeEnded.join(' | ')}`)
   log(ok ? '\nPASS — the session survived every outage in both directions' : '\nFAIL')

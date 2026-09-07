@@ -13,22 +13,39 @@
 // connection it dials a new WebSocket for the same session token and re-attaches
 // it to the existing Duplex.
 //
-// Byte accounting mirrors the proxy's, because neither side can know what the
-// other received:
+// Byte accounting is the proxy's, mirrored. Every offset is absolute — bytes
+// since the stream began — and there are two streams, one per direction:
 //
-//   received  bytes pushed into the Duplex (net-browserify's bytesRead, reported
-//             by the heartbeat) so the proxy knows what to replay
-//   txTotal   bytes handed to send()
-//   proxyRx   what the proxy says it has accepted; everything after it is kept
-//             and resent on reconnect
+//   bytesRead     our position in the proxy's stream: what we have received.
+//                 Stated in `resume:` and in every ping and pong.
+//   out.acked     the proxy's position in ours: what it has accepted. Everything
+//                 after it is retained and replayed on reconnect.
+//   out.produced  our own position in our stream. Nothing the proxy says may
+//                 exceed it.
 //
 // A send is not a delivery. Bytes sitting in a dying socket's buffer are lost
-// with no error anywhere, so only the peer's own count may free anything.
+// with no error anywhere, so only the peer's own offset may free anything.
+//
+// The window itself is `StreamBuffer`, the same component the proxy runs, with
+// the same positions and the same refusals. See streamBuffer.ts for the one
+// place the two implementations are allowed to differ.
 
 import net from 'net'
+import { StreamBuffer, StreamPositionError } from './streamBuffer'
 
 /** Cap on retained outbound bytes. Past this a resume cannot be honest. */
 const MAX_UNCONFIRMED_BYTES = 4 * 1024 * 1024
+
+/**
+ * Retained bytes past which we ask the proxy where it is, rather than waiting
+ * for the next heartbeat.
+ *
+ * The mirror of the proxy's `ackreq`, and on this side it is ours to decide for
+ * the same reason it is theirs to decide over there: only the holder of a buffer
+ * knows how full it is. The proxy cannot see this number and should not be
+ * guessing at it.
+ */
+const ASK_FOR_ACK_BYTES = MAX_UNCONFIRMED_BYTES / 2
 
 const RECONNECT_BASE_MS = 250
 const RECONNECT_MAX_MS = 5000
@@ -53,13 +70,11 @@ const RESUME_WINDOW_MS = 60_000
 const PEER_LEFT_CODES = new Set([1000, 1001, 1005])
 
 export interface ResumeState {
-  /** Bytes handed to send(). */
-  txTotal: number
-  /** What the proxy reports having accepted. */
-  proxyRx: number
-  /** Sent but unconfirmed, kept for replay. */
-  pending: Buffer[]
-  pendingBytes: number
+  /**
+   * The window over what we are sending. Head, cursor and produced, with the
+   * same operations and the same refusals as the proxy's — see streamBuffer.ts.
+   */
+  out: StreamBuffer
   /** Set when the stream can no longer be resumed honestly. */
   broken: boolean
   reconnecting: boolean
@@ -67,6 +82,18 @@ export interface ResumeState {
   resumes: number
   /** Set by end()/destroy() so a deliberate close is not treated as a drop. */
   closing: boolean
+  /** Set once the proxy has been asked where it is, cleared when it answers. */
+  ackAsked: boolean
+  /** Numbers our own pings; the proxy echoes it back. */
+  pingSeq: number
+  /**
+   * Whether the window is bound to a transport.
+   *
+   * The same rule the proxy applies: a transport carries nothing until the
+   * peer's position is known, because sending from our own estimate of it would
+   * re-send bytes the peer already holds.
+   */
+  attached: boolean
   /** Set once a transport has opened: before that, failures are connect errors. */
   connected: boolean
   /** When the current outage started, for the resume window. */
@@ -75,15 +102,15 @@ export interface ResumeState {
 
 const stateOf = (socket: any): ResumeState => {
   socket._resume ??= {
-    txTotal: 0,
-    proxyRx: 0,
-    pending: [],
-    pendingBytes: 0,
+    out: new StreamBuffer(MAX_UNCONFIRMED_BYTES),
     broken: false,
     reconnecting: false,
     attempts: 0,
     resumes: 0,
     closing: false,
+    ackAsked: false,
+    pingSeq: 0,
+    attached: false,
     connected: false,
     lostAt: undefined,
   } satisfies ResumeState
@@ -138,19 +165,21 @@ export const patchResumableSocket = () => {
     const state = stateOf(this)
     const buf: Buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding)
 
-    retain(this, state, buf)
-
-    const ws = this._ws
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      state.txTotal += buf.length
-      return originalWrite.call(this, chunk, encoding, callback)
+    if (!state.broken && !state.out.write(buf)) {
+      // The window is full. The proxy's answer here is to stall its producer,
+      // which closes the TCP window and stops Minecraft sending. Ours cannot be:
+      // this producer is mineflayer's physics loop, and stalling it freezes the
+      // player, which is what resumption exists to prevent. So the session ends
+      // instead.
+      giveUp(this, state, `unconfirmed output passed ${MAX_UNCONFIRMED_BYTES} bytes`)
     }
 
-    // No transport. The bytes are retained above, so they go out on reconnect.
-    //
-    // Reporting success is deliberate: applying backpressure here would stall
-    // mineflayer's physics loop, which is the thing keeping the player in
-    // control during the outage. Their actions queue instead of being lost.
+    pump(this, state)
+    askForAckIfFilling(this, state)
+
+    // Reporting success is deliberate even when nothing went out. Applying
+    // backpressure here would stall the physics loop; the player's actions queue
+    // instead of being lost.
     callback?.()
     return true
   }
@@ -167,38 +196,76 @@ export const patchResumableSocket = () => {
   }
 }
 
-/** Keep a sent chunk until the proxy confirms it. */
-const retain = (socket: any, state: ResumeState, buf: Buffer) => {
-  if (state.broken) return
+/**
+ * Move whatever the window has at its cursor onto the transport.
+ *
+ * The client's half of `DurableStream.serve`. It runs on writes and on attach
+ * rather than in a loop of its own, because in a browser the producer and the
+ * consumer are the same thread and there is nothing to wait on: a write is the
+ * only thing that creates work.
+ */
+const pump = (socket: any, state: ResumeState) => {
+  if (!state.attached) return
 
-  if (state.pendingBytes + buf.length > MAX_UNCONFIRMED_BYTES) {
-    // A byte stream cannot skip anything: dropping here would desync the cipher
-    // on any later resume. Mark the session unresumable rather than pretend.
-    giveUp(socket, state, `unconfirmed output passed ${MAX_UNCONFIRMED_BYTES} bytes`)
-    return
+  const ws = socket._ws
+  if (!ws || ws.readyState !== WebSocket.OPEN) return
+
+  for (;;) {
+    const chunk = state.out.next()
+    if (!chunk) return
+    try {
+      ws.send(chunk)
+    } catch {
+      // The transport died mid-send. The cursor is now ahead of what the proxy
+      // received; the resync at the next attach is what puts it back.
+      return
+    }
   }
-  state.pending.push(buf)
-  state.pendingBytes += buf.length
 }
 
-/** Release everything the proxy has confirmed receiving. */
-const confirmTo = (state: ResumeState, proxyRx: number) => {
-  if (proxyRx <= state.proxyRx) return
-  let free = proxyRx - state.proxyRx
-  state.proxyRx = proxyRx
+/**
+ * Apply a position the proxy has stated.
+ *
+ * `rewind` distinguishes the two frames that carry one: a ping or pong only
+ * frees, a resume also sends the cursor back so everything after it goes again.
+ * Both refusals are the proxy's, mirrored — a peer cannot have received what was
+ * never sent to it, nor ask for bytes already released.
+ */
+const acceptPosition = (socket: any, state: ResumeState, offset: number, rewind: boolean) => {
+  if (!Number.isFinite(offset) || state.broken) return
 
-  while (free > 0 && state.pending.length > 0) {
-    const head = state.pending[0]
-    if (head.length <= free) {
-      free -= head.length
-      state.pendingBytes -= head.length
-      state.pending.shift()
-    } else {
-      // The proxy confirmed part of this chunk; keep the remainder.
-      state.pending[0] = head.subarray(free)
-      state.pendingBytes -= free
-      free = 0
+  try {
+    if (rewind) state.out.resync(offset)
+    else state.out.ack(offset)
+  } catch (err) {
+    if (err instanceof StreamPositionError) {
+      giveUp(socket, state, err.message)
+      return
     }
+    throw err
+  }
+  state.ackAsked = false
+}
+
+/**
+ * Ask the proxy where it is, once we are holding too much.
+ *
+ * The mirror of the proxy's own prompt, and ours to decide for the same reason
+ * theirs is theirs: only the holder of a buffer knows how full it is. Useful
+ * only while there is a transport — during an outage there is nobody to ask, and
+ * that is when this grows fastest.
+ */
+const askForAckIfFilling = (socket: any, state: ResumeState) => {
+  if (state.ackAsked || state.out.length < ASK_FOR_ACK_BYTES) return
+
+  const ws = socket._ws
+  if (!ws || ws.readyState !== WebSocket.OPEN) return
+
+  state.ackAsked = true
+  try {
+    ws.send(`ping:${++state.pingSeq}:${socket.bytesRead ?? 0}`)
+  } catch {
+    state.ackAsked = false
   }
 }
 
@@ -218,8 +285,7 @@ const installPongHandler = (socket: any) => {
   // The proxy reports what it has accepted in its pong. That is the only thing
   // that frees retained output.
   socket.on('pong', (payload: string) => {
-    const proxyRx = Number(String(payload).split(':')[1])
-    if (Number.isFinite(proxyRx)) confirmTo(stateOf(socket), proxyRx)
+    acceptPosition(socket, stateOf(socket), Number(String(payload).split(':')[1]), false)
   })
 }
 
@@ -273,6 +339,14 @@ const attachTransport = (socket: any, ws: WebSocket, state: ResumeState, initial
       // Before 'connect', so nothing above can write ahead of the handshake.
       sendResumeOffset(socket, ws)
 
+      // Not attached yet: like every other attach, this one waits for the peer
+      // to say where it is. It costs one one-way latency on a connection that
+      // has just done an HTTP round trip to /connect anyway, and it means there
+      // is one rule rather than a rule and an exception.
+      //
+      // Attaching optimistically at zero looks safe — a fresh session really is
+      // at zero on both sides — but the peer's frame then arrives after bytes
+      // are already in flight, and applying its rewind resends them.
       state.connected = true
       socket._connecting = false
       socket.readable = true
@@ -306,22 +380,26 @@ const attachTransport = (socket: any, ws: WebSocket, state: ResumeState, initial
     const contents = e.data
 
     if (typeof contents === 'string') {
+      if (contents.startsWith('resume:')) {
+        acceptResume(socket, state, Number(contents.slice('resume:'.length)))
+        return
+      }
       if (contents.startsWith('pong:')) {
+        // A reply to our ping. Its offset frees retained output exactly as a
+        // ping's does; the event is what the latency plugin listens for.
+        acceptPosition(socket, state, Number(contents.slice('pong:'.length).split(':')[1]), false)
         socket.emit('pong', contents.slice('pong:'.length))
         return
       }
-      if (contents === 'ackreq') {
-        // The proxy is asking where we are, because its buffer is filling and
-        // nothing is released until we say. It knows how full it is and we do
-        // not, so it asks and we answer immediately rather than waiting for the
-        // heartbeat — which is a timer chosen for latency reporting, not for
-        // how fast the server happens to be sending.
-        //
-        // The ordinary heartbeat frame is the answer: one way of stating a
-        // position, prompted or not.
+      if (contents.startsWith('ping:')) {
+        // The proxy asking where we are, because its buffer is filling and
+        // nothing is released until we say. We do the same to it — same frame,
+        // same meaning, opposite direction.
+        const [seq, offset] = contents.slice('ping:'.length).split(':')
+        acceptPosition(socket, state, Number(offset), false)
         try {
-          ws.send(`ping:0:${socket.bytesRead ?? 0}`)
-        } catch { /* the socket died between the request and the reply */ }
+          ws.send(`pong:${seq}:${socket.bytesRead ?? 0}`)
+        } catch { /* the socket died between the ping and the reply */ }
         return
       }
       if (socket.handleStringMessage(contents)) {
@@ -338,6 +416,7 @@ const attachTransport = (socket: any, ws: WebSocket, state: ResumeState, initial
 
   ws.addEventListener('close', (e: any) => {
     if (socket._ws !== ws) return // already replaced
+    state.attached = false
 
     const peerLeft = PEER_LEFT_CODES.has(e?.code)
     // Read before destroying: destroy() is patched to set `closing`, so asking
@@ -374,6 +453,29 @@ const hostOf = (ws: WebSocket): string => {
   } catch {
     return 'unknown host'
   }
+}
+
+/**
+ * The proxy stating where it is, at attach.
+ *
+ * This is the whole resume in one frame: release everything it has, rewind to
+ * there, and send. Because the offset is the proxy's own truth rather than our
+ * estimate of it, nothing we send can be a byte it already holds — so there is
+ * nothing for it to discard, and the replay is exactly once.
+ */
+const acceptResume = (socket: any, state: ResumeState, offset: number) => {
+  if (state.attached) {
+    // One per connection, at the start. A second would rewind a cursor whose
+    // in-flight bytes are not lost, and resend them.
+    console.warn('[resume] ignoring a second resume frame on an attached transport')
+    return
+  }
+
+  acceptPosition(socket, state, offset, true)
+  if (state.broken) return
+
+  state.attached = true
+  pump(socket, state)
 }
 
 const deliver = (socket: any, buf: Buffer) => {
@@ -434,19 +536,18 @@ const reconnect = async (socket: any, state: ResumeState) => {
     if (!ws) continue
 
     socket._ws = ws
+    // Not attached until the proxy says where it is: sending from our own
+    // estimate would re-send bytes it already holds, and it has nothing to
+    // discard them with. The proxy applies the same rule to us.
+    state.attached = false
     attachTransport(socket, ws, state, false)
-
-    // Both positions, in order, before any data: where we are in the proxy's
-    // stream, then where our own replay begins. Nothing can interleave — this
-    // runs to completion without yielding.
     sendResumeOffset(socket, ws)
-    replay(socket, state)
 
     state.reconnecting = false
     state.attempts = 0
     state.lostAt = undefined
     state.resumes++
-    emit('resumed', { resumes: state.resumes, replayed: state.pendingBytes })
+    emit('resumed', { resumes: state.resumes, replayed: state.out.length })
     return
   }
 
@@ -477,38 +578,3 @@ const openSocket = async (url: string): Promise<WebSocket | null> => new Promise
   ws.addEventListener('error', onError)
   ws.addEventListener('close', onClose)
 })
-
-/**
- * Resend everything the proxy has not confirmed.
- *
- * Whether those bytes were actually lost is unknowable from here — only the
- * proxy knows what arrived — so everything unconfirmed goes again, prefixed by
- * where the replay starts so the proxy can drop what it already has.
- *
- * That prefix is not optional. Our idea of what the proxy accepted comes from
- * its pong replies and is always behind the truth: everything sent since the
- * last one has to be assumed lost. So the replay necessarily overlaps what the
- * proxy already forwarded to Minecraft, and a duplicated byte range corrupts
- * that stream exactly as thoroughly as a gap — the server reads a bogus packet
- * length and closes the connection.
- *
- * Live writes cannot overtake it: the caller attaches, hands over both offsets
- * and replays without yielding, so nothing else runs in between.
- */
-const replay = (socket: any, state: ResumeState) => {
-  try {
-    socket._ws.send(`sent:${state.proxyRx}`)
-  } catch {
-    return // the new socket died before the replay began
-  }
-
-  const pending = [...state.pending]
-  for (const chunk of pending) {
-    try {
-      socket._ws.send(chunk)
-      state.txTotal += chunk.length
-    } catch {
-      return // the new socket died mid-replay; the close handler takes over
-    }
-  }
-}

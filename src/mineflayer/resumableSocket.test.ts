@@ -9,7 +9,7 @@
 import { createRequire } from 'module'
 import net from 'net'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
-import { getResumeState, patchResumableSocket, type ResumeState } from './resumableSocket'
+import { getResumeState, patchResumableSocket, resumeEvents, type ResumeState } from './resumableSocket'
 
 // The app aliases `net` to net-browserify's browser build (rsbuildSharedConfig),
 // so that is the module under test — node's builtin `net` shares the name and
@@ -62,12 +62,18 @@ class FakeProxy {
   received: Buffer[] = []
   /** The URL of each connection, so the resume handshake can be asserted. */
   urls: string[] = []
-  /** What the proxy claims to have accepted, reported in its pongs. */
-  reportReceived = 0
+  /**
+   * What the proxy claims to have accepted. Null means "however much I really
+   * have", which is what a real peer reports; a number overrides it, for tests
+   * that need to drive the client from a specific position.
+   */
+  reportReceived: number | null = null
+
+  position () { return this.reportReceived ?? this.bytesReceived() }
   /** Every control frame received, in order. */
   control: string[] = []
-  /** Replayed bytes still to discard, per the client's `sent:` frame. */
-  skip = 0
+  /** Whether to answer the client's `resume:` with our own, as a peer does. */
+  announceOnResume = true
   /** The offset each connection opened with, in order. */
   resumedFrom: number[] = []
   /** Control frames, kept per connection so their order can be asserted. */
@@ -82,13 +88,7 @@ class FakeProxy {
       this.controlByConn.push(control)
       ws.on('message', (data: Buffer, isBinary: boolean) => {
         if (isBinary) {
-          let buf = Buffer.from(data)
-          if (this.skip > 0) {
-            const drop = Math.min(this.skip, buf.length)
-            this.skip -= drop
-            buf = buf.subarray(drop)
-          }
-          if (buf.length > 0) this.received.push(buf)
+          this.received.push(Buffer.from(data))
           return
         }
         const msg = data.toString()
@@ -96,17 +96,14 @@ class FakeProxy {
         control.push(msg)
         if (msg.startsWith('resume:')) {
           this.resumedFrom.push(Number(msg.slice('resume:'.length)))
+          // A real peer answers with its own position. Tests that want to drive
+          // the resume by hand turn this off.
+          if (this.announceOnResume) ws.send(`resume:${this.position()}`)
           return
         }
         if (msg.startsWith('ping:')) {
           const [seq] = msg.slice('ping:'.length).split(':')
-          ws.send(`pong:${seq}:${this.reportReceived}`)
-          return
-        }
-        if (msg.startsWith('sent:')) {
-          // What the real proxy does with it: discard the overlap between where
-          // the client is replaying from and what we already accepted.
-          this.skip = Math.max(0, this.bytesReceived() - Number(msg.slice('sent:'.length)))
+          ws.send(`pong:${seq}:${this.position()}`)
         }
       })
     })
@@ -232,7 +229,7 @@ describe('resumableSocket', () => {
     await waitFor('the drop to register', () => socket._ws.readyState !== 1)
 
     socket.write(Buffer.from('walked forward during the outage'))
-    expect(state(socket).pendingBytes).toBeGreaterThan(0)
+    expect(state(socket).out.length).toBeGreaterThan(0)
   })
 
   it('reconnects and replays what the proxy has not confirmed', async () => {
@@ -248,11 +245,11 @@ describe('resumableSocket', () => {
     await waitFor('a resume', () => state(socket).resumes === 1, 5000)
     await waitFor('the replay', () => proxy.allReceived().includes('during'), 5000)
 
-    // The client replays everything unconfirmed — including 'before', which the
-    // proxy already has — and states where the replay starts so the proxy can
-    // drop the overlap. What reaches the far end is each byte exactly once.
+    // The proxy states what it actually holds, so the client replays from there
+    // and only 'during' goes again. Each byte reaches the far end exactly once,
+    // with nothing for either end to de-duplicate.
     expect(proxy.allReceived()).toBe('beforeduring')
-    expect(proxy.control).toContain('sent:0')
+    expect(proxy.resumedFrom).toEqual([0, 0])
   })
 
   it('opens every connection by stating its position', async () => {
@@ -273,20 +270,29 @@ describe('resumableSocket', () => {
     expect(proxy.resumedFrom[1]).toBe(10)
   })
 
-  it('states its position before anything else on the wire', async () => {
-    // The proxy replays the instant it has the offset, so a frame that arrived
-    // after data would be describing a stream that had already moved.
+  it('sends nothing until the proxy states its position', async () => {
+    // Our own idea of where the proxy is comes from its replies and is always
+    // behind. Sending from there would re-send bytes it already holds, and it
+    // has nothing to discard them with — so the wire stays quiet until it says.
     const socket = await connect()
+
     socket.write(Buffer.from('hello'))
     await waitFor('delivery', () => proxy.bytesReceived() === 5)
 
+    proxy.announceOnResume = false // withhold it, and watch nothing happen
     proxy.kill()
-    await waitFor('a resume', () => state(socket).resumes === 1, 5000)
-    await waitFor('the replay', () => proxy.control.length >= 3, 5000)
+    await waitFor('a reconnect', () => proxy.resumedFrom.length === 2, 5000)
 
-    // On the resumed socket: our position in their stream, then where our own
-    // replay begins, and only then bytes.
-    expect(proxy.controlByConn[1]).toEqual(['resume:0', 'sent:0'])
+    // Reconnected, and holding: the client stated its position and is waiting.
+    socket.write(Buffer.from('written while waiting'))
+    await wait(300)
+    expect(proxy.bytesReceived()).toBe(5)
+    expect(state(socket).attached).toBe(false)
+
+    // The proxy speaks, and everything from that offset goes at once, in order.
+    proxy.current.send('resume:5')
+    await waitFor('the replay', () => proxy.bytesReceived() > 5, 3000)
+    expect(proxy.allReceived()).toBe('hellowritten while waiting')
   })
 
   it('continues the same byte stream across a resume', async () => {
@@ -312,33 +318,32 @@ describe('resumableSocket', () => {
 
     socket.write(Buffer.from('0123456789'))
     await waitFor('delivery', () => proxy.bytesReceived() === 10)
-    expect(state(socket).pendingBytes).toBe(10) // sent, but unconfirmed
+    expect(state(socket).out.length).toBe(10) // sent, but unconfirmed
 
     proxy.reportReceived = 6
     socket._ws.send('ping:1:0') // provoke a pong carrying the proxy's count
-    await waitFor('the acknowledgement', () => state(socket).proxyRx === 6)
+    await waitFor('the acknowledgement', () => state(socket).out.acked === 6)
 
-    expect(state(socket).pendingBytes).toBe(4)
+    expect(state(socket).out.length).toBe(4)
   })
 
-  it('replays only the unconfirmed remainder after an acknowledgement', async () => {
+  it('replays only what the proxy says it is missing', async () => {
+    // The proxy under-reports on purpose: it holds ten bytes but claims six.
+    // The client must believe it, because only the receiver knows — and must
+    // therefore send bytes 6..10 a second time.
     const socket = await connect()
 
     socket.write(Buffer.from('0123456789'))
     await waitFor('delivery', () => proxy.bytesReceived() === 10)
 
     proxy.reportReceived = 6
-    socket._ws.send('ping:1:0')
-    await waitFor('the acknowledgement', () => state(socket).proxyRx === 6)
-
     proxy.kill()
     await waitFor('a resume', () => state(socket).resumes === 1, 5000)
-    await waitFor('the resume handshake', () => proxy.control.includes('sent:6'), 5000)
-    await wait(300)
+    await waitFor('the replay', () => proxy.bytesReceived() > 10, 5000)
 
-    // The client replays from 6 — the last offset the proxy confirmed — and the
-    // proxy drops the four bytes of that replay it had already accepted.
-    expect(proxy.allReceived()).toBe('0123456789')
+    // Everything once, then bytes 6..10 again because the proxy claimed six.
+    expect(proxy.allReceived()).toBe('01234567896789')
+    expect(state(socket).out.acked).toBe(6)
   })
 
   it('survives longer than the connect timeout after a resume', async () => {
@@ -443,9 +448,51 @@ describe('resumableSocket', () => {
 
     proxy.reportReceived = 10
     socket._ws.send('ping:1:0')
-    await waitFor('the acknowledgement', () => state(socket).proxyRx === 10, 3000)
+    await waitFor('the acknowledgement', () => state(socket).out.acked === 10, 3000)
 
-    expect(state(socket).pendingBytes).toBe(0)
+    expect(state(socket).out.length).toBe(0)
+  })
+
+  it('refuses an acknowledgement for bytes it never sent', async () => {
+    // The mirror of the ceiling the proxy applies to us. Freeing on such a claim
+    // would drop bytes still waiting to go, and the next replay would start
+    // above them — a gap, which nothing downstream would catch.
+    const socket = await connect()
+    const events: any[] = []
+    resumeEvents.addEventListener('unresumable', e => events.push((e as CustomEvent).detail))
+
+    socket.write(Buffer.from('0123456789'))
+    await waitFor('delivery', () => proxy.bytesReceived() === 10)
+
+    proxy.reportReceived = 999
+    socket._ws.send('ping:1:0')
+    await waitFor('the refusal', () => state(socket).broken, 3000)
+
+    expect(state(socket).out.acked).toBe(0) // nothing was released on the claim
+    expect(events.at(-1)?.reason).toMatch(/only 10 was ever sent/)
+  })
+
+  it('asks the proxy where it is once its own retention fills', async () => {
+    // The mirror of `ackreq`, and ours to decide for the same reason theirs is
+    // theirs: only the holder of a buffer knows how full it is.
+    const socket = await connect()
+    const st = state(socket)
+
+    // Just under the mark: nothing asked.
+    st.out.write(Buffer.alloc(2 * 1024 * 1024 - 8))
+    socket.write(Buffer.from('....'))
+    await wait(50)
+    expect(proxy.control.filter(m => m.startsWith('ping:')).length).toBe(0)
+
+    // Over it: one ask, and only one, however many writes follow.
+    socket.write(Buffer.from('....'))
+    socket.write(Buffer.from('....'))
+    await waitFor('the ask', () => proxy.control.some(m => m.startsWith('ping:')), 2000)
+    await wait(100)
+    expect(proxy.control.filter(m => m.startsWith('ping:')).length).toBe(1)
+
+    // The answer re-arms it, or a session that filled once would never ask again.
+    await waitFor('the answer', () => !st.ackAsked, 2000)
   })
 
   it('survives repeated drops', async () => {
@@ -503,8 +550,8 @@ describe('resumableSocket — acknowledgement prompts', () => {
     proxy.current.send(Buffer.from('0123456789'), { binary: true })
     await waitFor('inbound data', () => socket.bytesRead === 10)
 
-    proxy.current.send('ackreq')
-    await waitFor('the answer', () => proxy.control.includes('ping:0:10'), 2000)
+    proxy.current.send('ping:7:0')
+    await waitFor('the answer', () => proxy.control.includes('pong:7:10'), 2000)
   })
 
   it('does not push a prompt into the byte stream', async () => {
@@ -525,7 +572,7 @@ describe('resumableSocket — acknowledgement prompts', () => {
     const chunks: Buffer[] = []
     socket.on('data', (c: Buffer) => chunks.push(c))
 
-    proxy.current.send('ackreq')
+    proxy.current.send('ping:1:0')
     proxy.current.send(Buffer.from('real data'), { binary: true })
     await waitFor('the data', () => Buffer.concat(chunks).toString() === 'real data', 2000)
 

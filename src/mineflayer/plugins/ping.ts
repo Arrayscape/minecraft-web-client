@@ -47,10 +47,11 @@ export default () => {
   /**
    * Round-trip time to the proxy, or PING_FAILED if it did not answer.
    *
-   * Wire format is `ping:<seq>:<rxOffset>`; the proxy echoes the sequence back
-   * and appends its own receive offset. It also still answers the bare
-   * `ping:<seq>` form, so an older proxy stays compatible — the reply is parsed
-   * on its first field either way.
+   * Wire format is `ping:<seq>:<offset>`, answered with `pong:<seq>:<offset>`.
+   * Both offsets are absolute, counted since the stream began; ours says how
+   * much of the proxy's stream we have received, theirs how much of ours they
+   * have accepted. The offset is not optional — a ping without one carries the
+   * only part worth having, and the proxy ignores it.
    */
   bot.pingProxy = async () => {
     const ws = getProxyWs()
