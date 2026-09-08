@@ -180,12 +180,14 @@ describe('resumableSocket', () => {
    * flow that opens a *new* TCP connection to Minecraft, and so is exactly what
    * a resume must not do.
    */
-  const connect = async (wsTimeout = 2000) => {
+  const connect = async (wsTimeout = 2000, silenceLimit?: number) => {
     proxy = new FakeProxy()
     await proxy.ready()
     netLib.setProxy({ hostname: 'http://127.0.0.1', port: String(proxy.port) })
 
     const socket = new netLib.Socket({ wsTimeout })
+    // Before the dial, so the very first transport is watched too.
+    if (silenceLimit !== undefined) socket._silenceLimit = silenceLimit
     sockets.push(socket)
     socket._connecting = true
     socket.writable = true
@@ -614,6 +616,90 @@ describe('resumableSocket', () => {
     expect(socket.destroyed).toBe(true)
   })
 
+  it('redials a transport that goes quiet without ever closing', async () => {
+    // The failure the watchdog exists for: the socket is still open by every
+    // measure the page can take, and carries nothing. A browser reports this
+    // only when the kernel abandons the TCP connection, tens of seconds after
+    // the proxy has already collected the session.
+    const socket = await connect(2000, 200)
+    expect(proxy.sockets.length).toBe(1)
+
+    // The fake proxy says nothing after its handshake, so silence arrives on
+    // its own. Nothing is closed, and no close event is ever fired.
+    // Wait for the handshake, not merely the connection: the socket is recorded
+    // when it is accepted, a moment before the client's frame lands on it.
+    await waitFor(
+      'the redial',
+      () => (proxy.controlByConn[1] ?? []).some(m => m.startsWith('resume:')),
+      5000
+    )
+
+    expect(proxy.sockets.length).toBeGreaterThan(1)
+    expect(state(socket).broken).toBeFalsy()
+  })
+
+  it('treats a heartbeat as proof the transport is alive', async () => {
+    // What keeps a healthy but idle session up: the beat is the proxy's, not
+    // the game's, so a quiet world never trips the watchdog.
+    const socket = await connect(2000, 300)
+
+    const beat = setInterval(() => {
+      try { proxy.current.send('ping:1:0') } catch { /* closed */ }
+    }, 75)
+    await new Promise(r => { setTimeout(r, 1200) })
+    clearInterval(beat)
+
+    // Four watchdog periods with no data at all, and the transport stands.
+    expect(proxy.sockets.length).toBe(1)
+    expect(state(socket).broken).toBeFalsy()
+  })
+
+  it('does not resend anything when a heartbeat states a position', async () => {
+    // A heartbeat grants permission to release, and nothing else. If it were
+    // applied as a resync it would rewind the cursor and replay every byte
+    // after the offset — silent duplication, and a desynchronised cipher above.
+    const socket = await connect()
+    socket.write(Buffer.from('abcdefghij'))
+    await waitFor('the write', () => Buffer.concat(proxy.received).length === 10, 5000)
+
+    // Their position, several times, including one they have already released
+    // past and one at zero.
+    proxy.current.send('ping:1:10')
+    proxy.current.send('ping:2:4')
+    proxy.current.send('ping:3:0')
+    await new Promise(r => { setTimeout(r, 200) })
+
+    expect(Buffer.concat(proxy.received).toString()).toBe('abcdefghij')
+    expect(state(socket).broken).toBeFalsy()
+  })
+
+  it('tells the player the session is gone while the retry loop is parked', async () => {
+    // The window used to be checked only at the top of the retry loop, and the
+    // loop does not always come back round: it parks on the browser's 'online'
+    // event while there is no network, and on a dial that a black-holed link
+    // will not fail quickly. So a player whose Wi-Fi was off for ten minutes sat
+    // in front of a frozen world with no message, and learned the session had
+    // ended only when connectivity returned — long after it actually had.
+    const socket = await connect()
+    socket._resumeWindow = 400
+    const gone: any[] = []
+    resumeEvents.addEventListener('unresumable', e => gone.push((e as CustomEvent).detail))
+
+    const realNavigator = globalThis.navigator
+    Object.defineProperty(globalThis, 'navigator', { value: { onLine: false }, configurable: true })
+    try {
+      proxy.kill()
+      // Nothing will dial: waitForOnline is waiting on an event that never
+      // comes. The deadline has to fire on its own or nobody ever speaks.
+      await waitFor('the give-up', () => gone.length > 0, 5000)
+    } finally {
+      Object.defineProperty(globalThis, 'navigator', { value: realNavigator, configurable: true })
+    }
+
+    expect(gone.at(-1).reason).toMatch(/no transport/)
+    expect(state(socket).broken).toBe(true)
+  })
+
   it('does not call a refused reattach a resume', async () => {
     // The dial succeeding is not the session resuming. Announcing it there told
     // the app the player was back on a socket the proxy was about to close with
@@ -641,7 +727,7 @@ describe('resumableSocket', () => {
     proxy.kill()
 
     await waitFor('the reattach', () => proxy.sockets.length > 1, 5000)
-    await new Promise(r => setTimeout(r, 100))
+    await new Promise(r => { setTimeout(r, 100) })
     expect(resumed).toEqual([])
 
     // The answer is what completes it.

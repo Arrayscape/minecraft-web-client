@@ -81,7 +81,59 @@ const RECONNECT_MAX_MS = 5000
  * against a session that no longer exists, which to the player looks exactly
  * like a hang.
  */
-const RESUME_WINDOW_MS = 60_000
+/**
+ * How long a transport may go without a single frame before we stop believing
+ * in it.
+ *
+ * The browser hands JavaScript no way to see a socket that has stopped
+ * delivering: WebSocket ping/pong is answered below the page and never surfaces,
+ * and a black-holed TCP connection produces no event until the kernel gives up.
+ * Measured in the field that took 73 seconds, against a proxy that noticed in
+ * 30 — so by the time the page reacted its session had already been collected
+ * and the resume was impossible. A dropped Wi-Fi interface is signalled at once
+ * and hides this; a venue network that black-holes, a NAT rebind on an access
+ * point roam, and a captive portal that holds the connection open while
+ * forwarding nothing do not.
+ *
+ * So the proxy beats every WSPingPeriod (10s, compiled in) with a `ping:` frame
+ * the page *can* see, and this is three of those — the same three-missed-beats
+ * rule the proxy applies to us with WSPongWait. Raising the proxy's period
+ * without raising this would make healthy sessions trip it.
+ *
+ * Deliberately not measured against Minecraft's own traffic: that would confuse
+ * a dead link with a stalled server, and reconnecting because the game went
+ * quiet costs a resume and fixes nothing.
+ */
+const SILENCE_LIMIT_MS = 30_000
+
+/**
+ * How long after the last frame the session is still worth chasing.
+ *
+ * Measured from the last frame rather than from the moment the loss was
+ * noticed, because those are not the same instant and the difference is the
+ * whole watchdog: noticing now takes 30s, so a window anchored to it ran to 90s
+ * against a proxy that had let go at 55.
+ *
+ * What bounds it is the *upstream*, not the proxy. Velocity's read-timeout and
+ * Paper's keep-alive both give 30s from the last inbound client data, after
+ * which the player has been dropped and no reconnection can produce a playable
+ * session — only a better-worded disconnect. Chasing past that point keeps the
+ * player staring at a frozen world hoping, which is worse than telling them.
+ *
+ * 40s rather than 30s because both clocks are staler than they look. The last
+ * frame we saw can be up to a heartbeat (10s) before the outage, since an idle
+ * world sends nothing else; Velocity's can be up to a keep-alive interval (15s)
+ * before it, for the mirror reason. From here the upstream therefore dies
+ * somewhere in lastAliveAt + [15, 40]. Giving up sooner than 40 could abandon a
+ * session that was still playable; at 40 it certainly is not.
+ *
+ * It is only a backstop. While the proxy is reachable it answers for itself with
+ * a 4004, which is both faster and better worded than anything inferred here;
+ * this covers the case where it cannot be reached at all. The proxy collects its
+ * side at WSPongWait + ResumeDeadline = 40s too, so the two can race — benignly,
+ * since either way the player is correctly told the session ended.
+ */
+const RESUME_WINDOW_MS = 40_000
 
 /**
  * Close codes that mean the peer closed deliberately rather than the network
@@ -134,6 +186,15 @@ export interface ResumeState {
    * drive everything and no timer is created at all.
    */
   pumpTimer: any
+  /** Fires when a transport has gone quiet for too long to still be alive. */
+  silenceTimer: any
+  /**
+   * When the transport last showed evidence of life — a frame, or the moment it
+   * opened. The instant the proxy's own budget runs from.
+   */
+  lastAliveAt?: number
+  /** Fires when the session can no longer be held, whatever the retry loop is doing. */
+  deadlineTimer: any
   /**
    * Set while a reattach is in flight, so that success is declared when the
    * peer answers rather than when the socket opens.
@@ -164,6 +225,9 @@ const stateOf = (socket: any): ResumeState => {
     ackAsked: false,
     pingSeq: 0,
     pumpTimer: undefined,
+    silenceTimer: undefined,
+    lastAliveAt: undefined,
+    deadlineTimer: undefined,
     resuming: false,
     attached: false,
     connected: false,
@@ -327,6 +391,95 @@ const stopPump = (state: ResumeState) => {
   state.pumpTimer = undefined
 }
 
+const clearDeadline = (state: ResumeState) => {
+  if (state.deadlineTimer === undefined) return
+  clearTimeout(state.deadlineTimer)
+  state.deadlineTimer = undefined
+}
+
+/**
+ * Give up when the proxy can no longer be holding the session.
+ *
+ * On its own timer rather than inside the retry loop, because the loop is not
+ * always running: it parks in `waitForOnline` while the browser reports no
+ * network, and in a dial that a black-holed link will not fail quickly. Checked
+ * only at the top of the loop, the window went unenforced for as long as the
+ * outage lasted — the player sat in front of a frozen world with no message, and
+ * was finally told the session had ended only when connectivity came back,
+ * minutes after it actually had.
+ */
+const armDeadline = (socket: any, state: ResumeState) => {
+  clearDeadline(state)
+  if (state.closing || state.broken) return
+  // Overridable per socket for tests, as _silenceLimit is.
+  const window: number = socket._resumeWindow ?? RESUME_WINDOW_MS
+  const since = state.lastAliveAt ?? Date.now()
+  const left = since + window - Date.now()
+  state.deadlineTimer = setTimeout(() => {
+    state.deadlineTimer = undefined
+    giveUp(socket, state, `no transport for ${Math.round(window / 1000)}s`)
+  }, Math.max(0, left))
+}
+
+const clearSilence = (state: ResumeState) => {
+  if (state.silenceTimer === undefined) return
+  clearTimeout(state.silenceTimer)
+  state.silenceTimer = undefined
+}
+
+/**
+ * (Re)start the silence watchdog for this transport.
+ *
+ * Any frame counts, control frames included: what is being tested is whether the
+ * transport still carries anything, not whether the game had something to say.
+ */
+const armSilence = (socket: any, state: ResumeState, ws: WebSocket) => {
+  clearSilence(state)
+  if (state.closing || state.broken) return
+  // Overridable per socket so a test can run the watchdog at millisecond scale,
+  // the way _wsTimeout already works for the connect timeout.
+  const limit: number = socket._silenceLimit ?? SILENCE_LIMIT_MS
+  state.lastAliveAt = Date.now()
+  state.silenceTimer = setTimeout(() => {
+    state.silenceTimer = undefined
+    if (socket._ws !== ws || state.closing || state.broken) return
+
+    trace(`no frame for ${limit / 1000}s; presuming the transport is dead`)
+
+    // Do not wait for the close event this close() will eventually produce. A
+    // close handshake on a link that is already swallowing packets is answered
+    // by nobody, and the browser sits on it — which is the exact delay this
+    // watchdog exists to cut short. Mark the socket so that when the event does
+    // arrive it is ignored rather than starting a second reconnect.
+    ;(ws as any)._abandoned = true
+    try {
+      ws.close()
+    } catch { /* already gone; the reconnect below is what matters */ }
+
+    loseTransport(socket, state)
+  }, limit)
+}
+
+/**
+ * Give up on the current transport and start looking for another.
+ *
+ * Shared by the close event and the silence watchdog, because a socket that
+ * closed and a socket that stopped speaking are the same situation: this side
+ * still holds everything the peer has not confirmed, and the session outlives
+ * the connection carrying it.
+ */
+const loseTransport = (socket: any, state: ResumeState) => {
+  state.attached = false
+  stopPump(state)
+  clearSilence(state)
+  clearDeadline(state)
+  state.lostAt ??= Date.now()
+  armDeadline(socket, state)
+  trace(`transport lost; holding ${state.out.length} bytes, will reconnect`)
+  emit('lost', { attempts: state.attempts })
+  void reconnect(socket, state)
+}
+
 /**
  * Apply a position the proxy has stated.
  *
@@ -381,6 +534,7 @@ const giveUp = (socket: any, state: ResumeState, reason: string) => {
   state.broken = true
   state.resuming = false
   stopPump(state)
+  clearSilence(state)
   console.warn(`[resume] ${reason}; this session can no longer be resumed`)
 
   // Say why before tearing anything down, so whatever is listening sets the
@@ -474,9 +628,16 @@ const attachTransport = (socket: any, ws: WebSocket, state: ResumeState, initial
       socket.readable = true
       socket.emit('connect')
       socket.read(0)
+
+      // From here a silent socket is a dead one — including a peer that accepts
+      // the connection and never states its position, which would otherwise
+      // leave this side attached to nothing for as long as it cared to wait.
+      armSilence(socket, state, ws)
     })
   } else {
     state.connected = true
+    // Already open: openSocket waited for that before handing it over.
+    armSilence(socket, state, ws)
   }
 
   ws.addEventListener('error', (e: any) => {
@@ -499,6 +660,11 @@ const attachTransport = (socket: any, ws: WebSocket, state: ResumeState, initial
   })
 
   ws.addEventListener('message', (e: MessageEvent) => {
+    // Anything at all proves the transport is carrying. Before the type is even
+    // looked at, because a control frame counts exactly as much as a chunk of
+    // world data for this purpose.
+    armSilence(socket, state, ws)
+
     const contents = e.data
 
     if (typeof contents === 'string') {
@@ -541,8 +707,11 @@ const attachTransport = (socket: any, ws: WebSocket, state: ResumeState, initial
 
   ws.addEventListener('close', (e: any) => {
     if (socket._ws !== ws) return // already replaced
+    // The watchdog already declared this one dead and moved on.
+    if ((ws as any)._abandoned) return
     state.attached = false
     stopPump(state) // it belongs to the transport that is going away
+    clearSilence(state)
 
     trace(`closed code=${e?.code ?? '?'}`, e?.reason ? `reason=${JSON.stringify(e.reason)}` : '(no reason)')
 
@@ -574,10 +743,7 @@ const attachTransport = (socket: any, ws: WebSocket, state: ResumeState, initial
       return
     }
 
-    state.lostAt ??= Date.now()
-    trace(`transport lost; holding ${state.out.length} bytes, will reconnect`)
-    emit('lost', { attempts: state.attempts })
-    void reconnect(socket, state)
+    loseTransport(socket, state)
   })
 }
 
@@ -623,6 +789,7 @@ const acceptResume = (socket: any, state: ResumeState, offset: number) => {
   // it.
   if (state.resuming) {
     state.resuming = false
+    clearDeadline(state)
     state.resumes++
     emit('resumed', { resumes: state.resumes, replayed: toReplay })
   }
@@ -668,7 +835,7 @@ const reconnect = async (socket: any, state: ResumeState) => {
   state.reconnecting = true
 
   while (!state.closing && !state.broken) {
-    if (Date.now() - (state.lostAt ?? Date.now()) > RESUME_WINDOW_MS) {
+    if (Date.now() - (state.lastAliveAt ?? state.lostAt ?? Date.now()) > RESUME_WINDOW_MS) {
       giveUp(socket, state, `no transport for ${Math.round(RESUME_WINDOW_MS / 1000)}s`)
       break
     }
