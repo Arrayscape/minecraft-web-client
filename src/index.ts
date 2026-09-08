@@ -674,7 +674,12 @@ export async function connect (connectOptions: ConnectOptions) {
           resumeEvents.addEventListener('lost', onLost)
           resumeEvents.addEventListener('resumed', onResumed)
           resumeEvents.addEventListener('unresumable', onUnresumable)
-          errorAbortController.signal.addEventListener('abort', () => {
+          // Tied to the bot, not to errorAbortController — that one aborts on
+          // 'login', which is the moment these events start mattering rather
+          // than the moment they stop. Hanging them off it made every resume
+          // invisible to the app and let an unresumable session fall through to
+          // the generic socketClosed message instead of saying why.
+          bot.once('end', () => {
             resumeEvents.removeEventListener('lost', onLost)
             resumeEvents.removeEventListener('resumed', onResumed)
             resumeEvents.removeEventListener('unresumable', onUnresumable)

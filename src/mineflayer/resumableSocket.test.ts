@@ -594,6 +594,26 @@ describe('resumableSocket', () => {
     void buffered
   })
 
+  it('announces the close when it gives up, so nothing keeps writing', async () => {
+    // Without this the protocol stack above never learns the socket is gone:
+    // the physics loop writes into a destroyed Duplex and the failure surfaces
+    // as "Cannot call write after a stream was destroyed" — an uncaught error
+    // with the actual reason nowhere near it.
+    const socket = await connect()
+    const order: string[] = []
+    resumeEvents.addEventListener('unresumable', () => order.push('unresumable'))
+    socket.on('close', () => order.push('close'))
+
+    proxy.refuseWith = 4004
+    proxy.kill()
+
+    await waitFor('the close to be announced', () => order.includes('close'), 5000)
+    // The reason goes out first, so whatever is listening wins the race to set
+    // what the player is told.
+    expect(order).toEqual(['unresumable', 'close'])
+    expect(socket.destroyed).toBe(true)
+  })
+
   it('survives repeated drops', async () => {
     const socket = await connect()
     const chunks: Buffer[] = []

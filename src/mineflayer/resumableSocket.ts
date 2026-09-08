@@ -169,6 +169,29 @@ const stateOf = (socket: any): ResumeState => {
 /** Resume state for a socket, for the UI and for tests. */
 export const getResumeState = (socket: any): ResumeState | undefined => socket?._resume
 
+/**
+ * Trace the protocol as this end speaks it.
+ *
+ * The negotiation is one exchange per connection, so it is always logged: when
+ * something goes wrong here it goes wrong once, at attach, and the two offsets
+ * involved are the whole story. `localStorage.resumeTrace = '1'` adds the
+ * heartbeat, which is every few seconds and drowns that story otherwise.
+ *
+ * Arrows are from this end's point of view: `->` sent, `<-` received.
+ */
+const chatty = (() => {
+  try {
+    return localStorage.getItem('resumeTrace') === '1'
+  } catch {
+    return false // storage can throw in a private window
+  }
+})()
+
+const trace = (...args: any[]) => console.log('[resume]', ...args)
+const traceChatty = (...args: any[]) => {
+  if (chatty) trace(...args)
+}
+
 /** Fired as the socket loses and regains its transport, for the HUD. */
 export const resumeEvents = new EventTarget()
 
@@ -339,6 +362,8 @@ const askForAckIfFilling = (socket: any, state: ResumeState) => {
   state.ackAsked = true
   try {
     ws.send(`ping:${++state.pingSeq}:${socket.bytesRead ?? 0}`)
+    trace(`-> ping:${state.pingSeq}:${socket.bytesRead ?? 0}`,
+      `(holding ${state.out.length} bytes unconfirmed; asking where they are)`)
   } catch {
     state.ackAsked = false
   }
@@ -350,8 +375,20 @@ const giveUp = (socket: any, state: ResumeState, reason: string) => {
   state.broken = true
   stopPump(state)
   console.warn(`[resume] ${reason}; this session can no longer be resumed`)
+
+  // Say why before tearing anything down, so whatever is listening sets the
+  // reason the player sees. What follows announces the end in the ordinary way,
+  // and the first end wins.
   emit('unresumable', { reason })
-  if (socket?.readyState === 'open') socket.destroy()
+
+  const wasOpen = socket?.readyState === 'open'
+  if (wasOpen) socket.destroy()
+
+  // Tell the protocol stack the socket is gone. Without this nothing above
+  // stops writing: the physics loop keeps going, hits a destroyed Duplex, and
+  // "Cannot call write after a stream was destroyed" surfaces as an uncaught
+  // protocol error — with the real reason nowhere in sight.
+  if (wasOpen) socket.emit('close')
 }
 
 const installPongHandler = (socket: any) => {
@@ -383,7 +420,9 @@ const installPongHandler = (socket: any) => {
  * this side would catch it, because `bytesRead` is a count, not a filter.
  */
 const sendResumeOffset = (socket: any, ws: WebSocket) => {
-  ws.send(`resume:${socket.bytesRead ?? 0}`)
+  const at = socket.bytesRead ?? 0
+  trace(`-> resume:${at}`, at === 0 ? '(nothing received yet)' : '(bytes of theirs we hold)')
+  ws.send(`resume:${at}`)
 }
 
 const attachTransport = (socket: any, ws: WebSocket, state: ResumeState, initial: boolean) => {
@@ -463,6 +502,7 @@ const attachTransport = (socket: any, ws: WebSocket, state: ResumeState, initial
       if (contents.startsWith('pong:')) {
         // A reply to our ping. Its offset frees retained output exactly as a
         // ping's does; the event is what the latency plugin listens for.
+        traceChatty(`<- ${contents}`, `(they hold ${state.out.length} of ours unconfirmed)`)
         acceptPosition(socket, state, Number(contents.slice('pong:'.length).split(':')[1]), false)
         socket.emit('pong', contents.slice('pong:'.length))
         return
@@ -472,9 +512,11 @@ const attachTransport = (socket: any, ws: WebSocket, state: ResumeState, initial
         // nothing is released until we say. We do the same to it — same frame,
         // same meaning, opposite direction.
         const [seq, offset] = contents.slice('ping:'.length).split(':')
+        traceChatty(`<- ${contents}`, '(their buffer is filling; they want our position)')
         acceptPosition(socket, state, Number(offset), false)
         try {
           ws.send(`pong:${seq}:${socket.bytesRead ?? 0}`)
+          traceChatty(`-> pong:${seq}:${socket.bytesRead ?? 0}`)
         } catch { /* the socket died between the ping and the reply */ }
         return
       }
@@ -494,6 +536,8 @@ const attachTransport = (socket: any, ws: WebSocket, state: ResumeState, initial
     if (socket._ws !== ws) return // already replaced
     state.attached = false
     stopPump(state) // it belongs to the transport that is going away
+
+    trace(`closed code=${e?.code ?? '?'}`, e?.reason ? `reason=${JSON.stringify(e.reason)}` : '(no reason)')
 
     const terminal = TERMINAL_CODES.get(e?.code)
     if (terminal) {
@@ -524,6 +568,7 @@ const attachTransport = (socket: any, ws: WebSocket, state: ResumeState, initial
     }
 
     state.lostAt ??= Date.now()
+    trace(`transport lost; holding ${state.out.length} bytes, will reconnect`)
     emit('lost', { attempts: state.attempts })
     void reconnect(socket, state)
   })
@@ -554,8 +599,13 @@ const acceptResume = (socket: any, state: ResumeState, offset: number) => {
     return
   }
 
+  const heldBefore = state.out.acked
   acceptPosition(socket, state, offset, true)
   if (state.broken) return
+
+  const toReplay = state.out.unsent
+  trace(`<- resume:${offset}`,
+    `(released ${offset - heldBefore}, replaying ${toReplay} bytes from ${offset})`)
 
   state.attached = true
   pump(socket, state)
@@ -614,6 +664,7 @@ const reconnect = async (socket: any, state: ResumeState) => {
     // eslint-disable-next-line no-await-in-loop -- as above
     await waitForOnline()
 
+    trace(`dialling (attempt ${state.attempts}, ${Math.round((Date.now() - (state.lostAt ?? Date.now())) / 1000)}s down)`)
     // eslint-disable-next-line no-await-in-loop -- as above
     const dialled = await openSocket(socket._resumeUrl)
     if (!(dialled instanceof WebSocket)) {
@@ -625,6 +676,7 @@ const reconnect = async (socket: any, state: ResumeState) => {
         giveUp(socket, state, dialled.reason || terminal)
         break
       }
+      trace(`dial failed code=${dialled.code} ${dialled.reason}; retrying`)
       continue
     }
     const ws = dialled
