@@ -135,6 +135,11 @@ export interface ResumeState {
    */
   pumpTimer: any
   /**
+   * Set while a reattach is in flight, so that success is declared when the
+   * peer answers rather than when the socket opens.
+   */
+  resuming: boolean
+  /**
    * Whether the window is bound to a transport.
    *
    * The same rule the proxy applies: a transport carries nothing until the
@@ -159,6 +164,7 @@ const stateOf = (socket: any): ResumeState => {
     ackAsked: false,
     pingSeq: 0,
     pumpTimer: undefined,
+    resuming: false,
     attached: false,
     connected: false,
     lostAt: undefined,
@@ -373,6 +379,7 @@ const askForAckIfFilling = (socket: any, state: ResumeState) => {
 const giveUp = (socket: any, state: ResumeState, reason: string) => {
   if (state.broken) return
   state.broken = true
+  state.resuming = false
   stopPump(state)
   console.warn(`[resume] ${reason}; this session can no longer be resumed`)
 
@@ -609,6 +616,16 @@ const acceptResume = (socket: any, state: ResumeState, offset: number) => {
 
   state.attached = true
   pump(socket, state)
+
+  // A resume is complete when the peer has stated its position and this side is
+  // sending again — not when the socket opened. Declaring it at dial time meant
+  // announcing success to a session the proxy was about to refuse, and counting
+  // it.
+  if (state.resuming) {
+    state.resuming = false
+    state.resumes++
+    emit('resumed', { resumes: state.resumes, replayed: toReplay })
+  }
 }
 
 const deliver = (socket: any, buf: Buffer) => {
@@ -686,14 +703,15 @@ const reconnect = async (socket: any, state: ResumeState) => {
     // estimate would re-send bytes it already holds, and it has nothing to
     // discard them with. The proxy applies the same rule to us.
     state.attached = false
+    state.resuming = true
     attachTransport(socket, ws, state, false)
     sendResumeOffset(socket, ws)
 
+    // The dial succeeded, so stop backing off. Whether the *session* resumed is
+    // not known yet; acceptResume says so when the peer answers.
     state.reconnecting = false
     state.attempts = 0
     state.lostAt = undefined
-    state.resumes++
-    emit('resumed', { resumes: state.resumes, replayed: state.out.length })
     return
   }
 

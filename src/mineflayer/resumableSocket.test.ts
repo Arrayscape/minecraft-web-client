@@ -614,6 +614,42 @@ describe('resumableSocket', () => {
     expect(socket.destroyed).toBe(true)
   })
 
+  it('does not call a refused reattach a resume', async () => {
+    // The dial succeeding is not the session resuming. Announcing it there told
+    // the app the player was back on a socket the proxy was about to close with
+    // "no such session", and counted a resume that never happened.
+    const socket = await connect()
+    const resumed: any[] = []
+    resumeEvents.addEventListener('resumed', e => resumed.push((e as CustomEvent).detail))
+
+    proxy.refuseWith = 4004
+    proxy.kill()
+
+    await waitFor('the refusal', () => state(socket).broken, 5000)
+    expect(resumed).toEqual([])
+    expect(state(socket).resumes).toBe(0)
+  })
+
+  it('waits for the peer to answer before declaring a resume', async () => {
+    const socket = await connect()
+    const resumed: any[] = []
+    resumeEvents.addEventListener('resumed', e => resumed.push((e as CustomEvent).detail))
+
+    // Accepts the socket but says nothing back: this side is connected and has
+    // stated its position, and still knows nothing about where the peer is.
+    proxy.announceOnResume = false
+    proxy.kill()
+
+    await waitFor('the reattach', () => proxy.sockets.length > 1, 5000)
+    await new Promise(r => setTimeout(r, 100))
+    expect(resumed).toEqual([])
+
+    // The answer is what completes it.
+    proxy.current.send('resume:0')
+    await waitFor('the resume', () => resumed.length > 0, 5000)
+    expect(state(socket).resumes).toBe(1)
+  })
+
   it('survives repeated drops', async () => {
     const socket = await connect()
     const chunks: Buffer[] = []
