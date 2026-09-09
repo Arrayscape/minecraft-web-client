@@ -673,6 +673,27 @@ describe('resumableSocket', () => {
     expect(state(socket).broken).toBeFalsy()
   })
 
+  it('does not kill a session that came back', async () => {
+    // The deadline is armed when the transport is lost and has to be disarmed
+    // when one is found. Left running, it fires on a session that recovered
+    // perfectly well and disconnects the player for no reason — and no test
+    // using the real 40s window would run long enough to notice.
+    const socket = await connect()
+    socket._resumeWindow = 400
+    const gone: any[] = []
+    resumeEvents.addEventListener('unresumable', e => gone.push((e as CustomEvent).detail))
+
+    proxy.kill()
+    await waitFor('the resume', () => state(socket).resumes === 1, 5000)
+
+    // Well past the deadline that was armed at the drop.
+    await new Promise(r => { setTimeout(r, 700) })
+
+    expect(gone).toEqual([])
+    expect(state(socket).broken).toBeFalsy()
+    expect(socket.destroyed).toBeFalsy()
+  })
+
   it('tells the player the session is gone while the retry loop is parked', async () => {
     // The window used to be checked only at the top of the retry loop, and the
     // loop does not always come back round: it parks on the browser's 'online'
