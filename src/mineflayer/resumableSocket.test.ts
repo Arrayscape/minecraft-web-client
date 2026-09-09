@@ -48,9 +48,46 @@ vi.mock('net', async () => {
 // keeps TypeScript from resolving a stale declaration for a test-only server.
 const { WebSocketServer } = createRequire(import.meta.url)('ws')
 
+// `net` in this file is net-browserify, per the mock above. The relay needs the
+// real one, so ask for it by its node: specifier, which the mock does not cover.
+const netReal = createRequire(import.meta.url)('node:net')
+
 // net-browserify's surface is nothing like node's `net`, whose types TypeScript
 // resolves for this specifier no matter what the bundler aliases it to.
 const netLib = net as any
+
+// --- a relay that can stall a dial -----------------------------------------
+//
+// A dial has no deadline, so it can outlive the session it was for. Reproducing
+// that needs a connection that is accepted at once but completes its handshake
+// late: TCP is established, the upgrade request is sent, and the response comes
+// back only after the resume window has expired.
+class StallRelay {
+  server: any
+  port = 0
+  stallMs = 0
+
+  constructor (private readonly toPort: number) {
+    this.server = netReal.createServer((down: any) => {
+      const open = () => {
+        const up = netReal.connect(this.toPort, '127.0.0.1', () => {
+          down.pipe(up)
+          up.pipe(down)
+        })
+        up.on('error', () => down.destroy())
+      }
+      if (this.stallMs > 0) setTimeout(open, this.stallMs)
+      else open()
+    })
+  }
+
+  async ready () {
+    await new Promise<void>(r => { this.server.listen(0, '127.0.0.1', () => r()) })
+    this.port = this.server.address().port
+  }
+
+  close () { this.server.close() }
+}
 
 // --- a fake proxy ----------------------------------------------------------
 
@@ -80,6 +117,8 @@ class FakeProxy {
   resumedFrom: number[] = []
   /** Control frames, kept per connection so their order can be asserted. */
   controlByConn: string[][] = []
+  /** How many accepted connections have since closed. */
+  closed = 0
 
   constructor () {
     this.server = new WebSocketServer({ port: 0 })
@@ -90,6 +129,7 @@ class FakeProxy {
       }
       this.urls.push(req.url ?? '')
       this.sockets.push(ws)
+      ws.on('close', () => { this.closed++ })
       const control: string[] = []
       this.controlByConn.push(control)
       ws.on('message', (data: Buffer, isBinary: boolean) => {
@@ -180,14 +220,16 @@ describe('resumableSocket', () => {
    * flow that opens a *new* TCP connection to Minecraft, and so is exactly what
    * a resume must not do.
    */
-  const connect = async (wsTimeout = 2000, silenceLimit?: number) => {
+  const connect = async (wsTimeout = 2000, silenceLimit?: number, resumeWindow?: number) => {
     proxy = new FakeProxy()
     await proxy.ready()
     netLib.setProxy({ hostname: 'http://127.0.0.1', port: String(proxy.port) })
 
     const socket = new netLib.Socket({ wsTimeout })
-    // Before the dial, so the very first transport is watched too.
+    // Before the dial, so the very first transport is watched too — and so the
+    // watcher's poll interval is derived from these rather than the defaults.
     if (silenceLimit !== undefined) socket._silenceLimit = silenceLimit
+    if (resumeWindow !== undefined) socket._resumeWindow = resumeWindow
     sockets.push(socket)
     socket._connecting = true
     socket.writable = true
@@ -673,13 +715,48 @@ describe('resumableSocket', () => {
     expect(state(socket).broken).toBeFalsy()
   })
 
+  it('closes a dial that succeeds after the session was given up', async () => {
+    // A dial has no deadline, so on a black-holed link it can still be in flight
+    // when the resume window expires. Whatever it eventually returns belongs to
+    // a session nobody is holding — and if it succeeded, it is an open socket to
+    // the proxy that nothing owns and nothing would ever close.
+    proxy = new FakeProxy()
+    await proxy.ready()
+    const relay = new StallRelay(proxy.port)
+    await relay.ready()
+    netLib.setProxy({ hostname: 'http://127.0.0.1', port: String(relay.port) })
+
+    const socket = new netLib.Socket({ wsTimeout: 2000 })
+    socket._resumeWindow = 1500
+    sockets.push(socket)
+    socket._connecting = true
+    socket.writable = true
+    socket._connectWebSocket('test-token')
+    await waitFor('the socket to connect', () => socket.readyState === 'open')
+    expect(proxy.sockets.length).toBe(1)
+
+    const gone: any[] = []
+    resumeEvents.addEventListener('unresumable', e => gone.push((e as CustomEvent).detail))
+
+    // From here every handshake completes only after the window has expired.
+    relay.stallMs = 2500
+    proxy.kill()
+
+    await waitFor('the give-up', () => gone.length > 0, 8000)
+    // The stalled dial has not returned yet; it must not leave a socket behind.
+    await waitFor('the late dial to land and be closed',
+      () => proxy.sockets.length > 1 && proxy.closed >= proxy.sockets.length,
+      12_000)
+
+    relay.close()
+  })
+
   it('does not kill a session that came back', async () => {
     // The deadline is armed when the transport is lost and has to be disarmed
     // when one is found. Left running, it fires on a session that recovered
     // perfectly well and disconnects the player for no reason — and no test
     // using the real 40s window would run long enough to notice.
-    const socket = await connect()
-    socket._resumeWindow = 400
+    const socket = await connect(2000, undefined, 400)
     const gone: any[] = []
     resumeEvents.addEventListener('unresumable', e => gone.push((e as CustomEvent).detail))
 
@@ -701,8 +778,7 @@ describe('resumableSocket', () => {
     // will not fail quickly. So a player whose Wi-Fi was off for ten minutes sat
     // in front of a frozen world with no message, and learned the session had
     // ended only when connectivity returned — long after it actually had.
-    const socket = await connect()
-    socket._resumeWindow = 400
+    const socket = await connect(2000, undefined, 400)
     const gone: any[] = []
     resumeEvents.addEventListener('unresumable', e => gone.push((e as CustomEvent).detail))
 
