@@ -30,7 +30,29 @@ try { require('./localSettings.js') } catch { }
 
 const execAsync = promisify(childProcess.exec)
 
-const buildingVersion = new Date().toISOString().split(':')[0]
+// Identity of this build, for the update check. Full precision on purpose: this
+// was truncated to the hour, so two deploys in the same hour were indistinguishable
+// and a returning player was told they had the latest when they did not.
+const buildingVersion = new Date().toISOString()
+
+// What the running code calls itself. Baked in, so it changes exactly when the
+// bundle does — unlike a value read from config.json at runtime, which reports
+// the deployed release while the browser is still executing the previous one.
+const buildTag = (() => {
+    // --dirty is not decoration. Without it `--exact-match` reports the tag
+    // whenever HEAD sits on one, no matter what is uncommitted, so a bundle
+    // built from tag-plus-local-edits claims to be the release — the same
+    // false provenance this value exists to replace.
+    const describe = (args: string) => {
+        try {
+            return childProcess.execSync(`git describe --tags ${args} 2>/dev/null`).toString().trim() || undefined
+        } catch {
+            return undefined
+        }
+    }
+    return describe('--exact-match --dirty=" [dirty]"')
+        ?? describe('--always --dirty=" [dirty]"')
+})()
 
 const dev = process.env.NODE_ENV === 'development'
 const disableServiceWorker = process.env.DISABLE_SERVICE_WORKER === 'true'
@@ -155,6 +177,7 @@ const appConfig = defineConfig({
         // ],
         define: {
             'process.env.BUILD_VERSION': JSON.stringify(!dev ? buildingVersion : 'undefined'),
+            'process.env.BUILD_TAG': JSON.stringify(buildTag),
             'process.env.MAIN_MENU_LINKS': JSON.stringify(process.env.MAIN_MENU_LINKS),
             'process.env.SINGLE_FILE_BUILD': JSON.stringify(process.env.SINGLE_FILE_BUILD),
             'process.env.SINGLE_FILE_BUILD_MODE': JSON.stringify(process.env.SINGLE_FILE_BUILD),

@@ -260,7 +260,12 @@ export default ({
               </div>
             })}
           </div>
-          <span>{appConfig?.rightSideText}</span>
+          {/* The baked-in tag wins over the one from config.json: config.json is
+              fetched at runtime, so after a deploy it reports the new release
+              while the browser is still running the previous bundle out of
+              cache — the one indicator you would check to confirm a deploy,
+              asserting the opposite of the truth. */}
+          <span>{process.env.BUILD_TAG ?? appConfig?.rightSideText}</span>
         </span>
       </div>
     </div>

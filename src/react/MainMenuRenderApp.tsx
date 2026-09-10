@@ -95,10 +95,28 @@ export default () => {
     } else if (process.env.NODE_ENV === 'development') {
       setVersionStatus('(dev)')
     } else {
-      fetch('./version.txt').then(async (f) => {
+      // Absolute, and explicitly uncached. Relative resolves to
+      // /play/version.txt under a magic-link URL, which matches the /play/
+      // location rather than `location = /version.txt`, so the probe misses its
+      // no-cache header and can itself be answered from cache — a freshness
+      // check served stale reports whatever it last saw.
+      fetch('/version.txt', { cache: 'no-store' }).then(async (f) => {
         if (f.status === 404) return
-        const contents = await f.text()
+        const contents = (await f.text()).trim()
         const isLatest = contents === process.env.BUILD_VERSION
+
+        // A mismatch means this tab is running superseded code. Refresh once per
+        // remote version: enough to pick it up, and bounded, so a bundle that
+        // somehow cannot update cannot spin. Previously this only acted when
+        // sessionStorage.justReloaded happened to be set, so an ordinary first
+        // load after a deploy simply displayed "new version available" and went
+        // on running the old code.
+        if (!isLatest && sessionStorage.reloadedFor !== contents) {
+          sessionStorage.reloadedFor = contents
+          setVersionStatus('(updating, wait)')
+          void refreshApp(true)
+          return
+        }
         if (!isLatest && sessionStorage.justReloaded) {
           setVersionStatus('(force reloading, wait)')
           void refreshApp(true)

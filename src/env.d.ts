@@ -27,6 +27,8 @@ declare namespace NodeJS {
 
     // Build info. Release information
     RELEASE_TAG?: string
+    /** Git tag of the running bundle, baked in at build time. */
+    BUILD_TAG?: string
     RELEASE_LINK?: string
     RELEASE_CHANGELOG?: string
 
