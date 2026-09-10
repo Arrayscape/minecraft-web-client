@@ -26,11 +26,6 @@
 // out of a live session — the one outcome this must never produce.
 const ASK_TIMEOUT_MS = 2000
 
-// How long a navigation waits for the network before the precached shell is
-// served instead. Long enough for a bad connection to answer, short enough that
-// a dead one does not strand the player on a blank page.
-const NAVIGATION_TIMEOUT_MS = 4000
-
 // Substituted at build time (see rsbuild.config.ts). Lets the sweep below tell a
 // client that is merely uncontrolled from one that is actually out of date.
 const BUILD_VERSION = '__MWC_BUILD_VERSION__'
@@ -69,62 +64,19 @@ const askClient = async (client) => {
   })
 }
 
-// Navigations go to the network, always, with cache only as a fallback.
+// Navigations are deliberately NOT intercepted here.
 //
-// This is what makes a deploy visible on the *first* page open rather than after
-// one. Workbox precaches index.html and, via its directoryIndex default, answers
-// a request for "/" out of that precache — so the old shell is served without
-// the network being consulted at all, and the only thing that could notice a new
-// release is the incoming worker, which cannot act until it has downloaded the
-// entire app. That is a lag measured in however long the bundle takes.
+// An earlier version served them network-first so a deploy would be picked up on
+// the first page open rather than the second. It worked, and it cost too much:
+// every in-app `location.reload()` — which is what "Disconnect & Reset" does
+// (flyingSquidUtils.disconnect) — went through a fresh network fetch of the
+// shell raced against a timeout, so leaving a game took seconds instead of being
+// instant. It also broke on redirects: respondWith throws TypeError when handed
+// a redirected response for a navigation, and `location = /play` is a 302.
 //
-// Fetching the shell instead costs a few KB against a no-cache endpoint, and it
-// settles the question immediately: the fresh HTML names fresh hashed chunks,
-// none of which are in the old precache, so they miss every precache route and
-// load from the network too. The page is on the new build before the new worker
-// has finished installing.
-//
-// Registered here, ahead of workbox's own routes, because the first listener to
-// call respondWith owns the request.
-self.addEventListener('fetch', (event) => {
-  const request = event.request
-  if (request.mode !== 'navigate') return
-
-  event.respondWith((async () => {
-    const cachedShell = async () => {
-      // ignoreSearch because workbox stores revisioned entries under a
-      // __WB_REVISION__ query, so an exact match on './index.html' misses.
-      const cached = await caches.match('./index.html', { ignoreSearch: true })
-      return cached ?? Response.error()
-    }
-
-    let timer
-    try {
-      // Bounded, because these are venue networks: a link that is merely slow
-      // rather than down would otherwise hold the page on a blank screen for as
-      // long as it felt like. Falling back to the precached shell keeps the
-      // client usable, and the incoming worker still navigates it once it has
-      // installed, so a stale shell here self-corrects rather than sticking.
-      const timeout = new Promise((_, reject) => {
-        timer = setTimeout(() => { reject(new Error('navigation fetch timed out')) }, NAVIGATION_TIMEOUT_MS)
-      })
-      const response = await Promise.race([fetch(request), timeout])
-      // A reply is not the same as a working one. Captive portals and failing
-      // edges answer promptly with something useless, and handing that to the
-      // player instead of the app we already hold would be a worse outcome than
-      // being offline outright.
-      if (!response || !response.ok) {
-        throw new Error(`navigation returned ${response ? response.status : 'nothing'}`)
-      }
-      return response
-    } catch (err) {
-      log('serving the cached shell', err)
-      return cachedShell()
-    } finally {
-      clearTimeout(timer)
-    }
-  })())
-})
+// Letting the precache answer navigations restores that speed. The cost is that
+// a new build lands one navigation later than it could, which the sweep below
+// already handles.
 
 self.addEventListener('activate', (event) => {
   event.waitUntil((async () => {

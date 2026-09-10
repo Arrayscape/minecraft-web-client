@@ -303,7 +303,16 @@ const mapSlots = (slots: Array<RenderItem | Item | null>, isJei = false) => {
 export const upInventoryItems = (isInventory: boolean, invWindow = lastWindow) => {
   // inv.pwindow.inv.slots[2].displayName = 'test'
   // inv.pwindow.inv.slots[2].blockData = getBlockData('dirt')
-  const customSlots = mapSlots((isInventory ? bot.inventory : bot.currentWindow)!.slots)
+  // Absent rather than impossible, despite the assertion this used to carry.
+  // The resources manager fires this the moment atlases finish, which races the
+  // bot coming up: if assets win, there is no inventory yet and the read throws.
+  // The throw is then reported as the session's failure — a player whose connect
+  // was slow or failed sees "Cannot read properties of undefined (reading
+  // 'slots')" instead of whatever actually went wrong, and index.html's error
+  // handler unregisters their service worker on top of it.
+  const container = isInventory ? bot.inventory : bot.currentWindow
+  if (!container) return
+  const customSlots = mapSlots(container.slots)
   invWindow.pwindow.setSlots(customSlots)
   return customSlots
 }
