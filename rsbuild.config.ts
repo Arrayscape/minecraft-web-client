@@ -305,11 +305,19 @@ const appConfig = defineConfig({
                             console.log('single file size', (fs.statSync(singleBuildHtml).size / 1024 / 1024).toFixed(2), 'mb')
                         } else {
                             if (!disableServiceWorker) {
+                            // The worker imports this; it has to exist next to it.
+                            fs.copyFileSync('./scripts/sw-reload.js', './dist/sw-reload.js')
                             const { count, size, warnings } = await generateSW({
                                     // dontCacheBustURLsMatching: [new RegExp('...')],
                                     globDirectory: 'dist',
                                     skipWaiting: true,
                                     clientsClaim: true,
+                                    // Carries the build stamp so the import URL changes every
+                                    // deploy. importScripts is served from the HTTP cache
+                                    // (updateViaCache defaults to 'imports'), so a stable URL
+                                    // would let a stale copy of this outlive the worker that
+                                    // imports it.
+                                    importScripts: [`./sw-reload.js?v=${encodeURIComponent(buildingVersion)}`],
                                     additionalManifestEntries: getSwAdditionalEntries(),
                                     globPatterns: [],
                                     swDest: './dist/service-worker.js',

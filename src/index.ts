@@ -63,7 +63,7 @@ import defaultServerOptions from './defaultLocalServerOptions'
 import { onAppLoad, resourcepackReload, resourcePackState } from './resourcePack'
 import { ConnectPeerOptions, connectToPeer } from './localServerMultiplayer'
 import CustomChannelClient from './customClient'
-import { registerServiceWorker } from './serviceWorker'
+import { listenForReloadRequests, registerServiceWorker } from './serviceWorker'
 import { appStatusState, lastConnectOptions, quickDevReconnect, resetAppStatusState } from './react/AppStatusProvider'
 
 import { fsState } from './loadSave'
@@ -107,6 +107,9 @@ window.beforeRenderFrame = []
 
 // ACTUAL CODE
 
+// Before registration, so a worker that activates immediately still finds
+// someone listening to ask.
+listenForReloadRequests()
 void registerServiceWorker().then(() => {
   mainMenuState.serviceWorkerLoaded = true
 })
