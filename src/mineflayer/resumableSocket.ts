@@ -573,7 +573,12 @@ const askForAckIfFilling = (socket: any, state: ResumeState) => {
 
   state.ackAsked = true
   try {
-    ws.send(`ping:${++state.pingSeq}:${socket.bytesRead ?? 0}`)
+    // Namespaced. Two senders share this socket — this window prompt and the
+    // latency plugin's pingProxy — with independent counters that both started
+    // at 1, so the proxy's verbatim echo could resolve one sender's pong against
+    // the other's pending ping and report a round trip that never happened.
+    // The proxy treats seq as an opaque string, so a prefix costs nothing.
+    ws.send(`ping:w${++state.pingSeq}:${socket.bytesRead ?? 0}`)
     trace(`-> ping:${state.pingSeq}:${socket.bytesRead ?? 0}`,
       `(holding ${state.out.length} bytes unconfirmed; asking where they are)`)
   } catch {

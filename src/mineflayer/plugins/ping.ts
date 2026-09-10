@@ -64,11 +64,14 @@ export default () => {
       const sentAt = Date.now()
 
       const onPong = (received: string) => {
-        const [ackSeq, proxyRx] = String(received).split(':')
-        if (ackSeq !== curSeq.toString()) return
-        // Stashed for the resume handshake, which needs the proxy's view of
-        // how much of our output it accepted.
-        if (proxyRx !== undefined) socket._proxyRxFromClient = Number(proxyRx)
+        const [ackSeq] = String(received).split(':')
+        // Prefixed to keep this sender's sequence apart from resumableSocket's
+        // window prompts, which share the socket and once used the same numbers.
+        // Identity matters here and only here: the offset a pong carries is the
+        // proxy's session-wide receive count, true whoever asked for it, and
+        // resumableSocket applies every one it sees. A round trip is the one
+        // thing that is meaningless unless it is answering *your* ping.
+        if (ackSeq !== `p${curSeq}`) return
         finish(Date.now() - sentAt)
       }
 
@@ -84,7 +87,7 @@ export default () => {
       socket.on('pong', onPong)
 
       try {
-        ws.send(`ping:${curSeq}:${getRxOffset()}`)
+        ws.send(`ping:p${curSeq}:${getRxOffset()}`)
       } catch {
         // Socket closed between the readyState check and the send.
         finish(PING_FAILED)

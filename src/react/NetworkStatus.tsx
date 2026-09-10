@@ -71,6 +71,14 @@ export default () => {
   const { proxy: proxyUrl } = lastConnectOptions.value!
   const pingTotal = serverPing
 
+  // The proxy→server leg is not measured, only inferred: total minus the leg to
+  // the proxy. The two come from different round trips taken at different
+  // moments, so the subtraction can go negative — which it visibly did, showing
+  // "-42ms" for a leg that cannot be less than zero. A number that cannot be
+  // derived is better shown as unknown than as a confident absurdity.
+  const derivedLeg = pingTotal === null || proxyPing === null ? null : pingTotal - proxyPing
+  const remainingLeg = pingTotal === null ? '...' : (derivedLeg === null || derivedLeg < 0 ? '?' : `${derivedLeg}ms`)
+
   const ICON_SIZE = 18
 
   return (
@@ -93,7 +101,7 @@ export default () => {
         </>
       )}
       <span className={`${styles.dataRow} ${styles.ping} ${isServerStale ? styles.stale : ''}`}>
-        {isWebSocket ? (pingTotal || '?') : (pingTotal ? pingTotal - (proxyPing ?? 0) : '...')}ms
+        {isWebSocket ? `${pingTotal || '?'}ms` : remainingLeg}
       </span>
       <span className={styles.dataRow}>{serverIp}</span>
 
