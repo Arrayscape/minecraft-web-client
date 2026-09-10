@@ -21,6 +21,15 @@ import { activeModalStack, miscUiState } from './globalState'
  */
 export const listenForReloadRequests = () => {
   if (!('serviceWorker' in navigator)) return
+
+  // Without this the listener below never fires. Message delivery on
+  // navigator.serviceWorker starts only when `onmessage` is assigned or
+  // startMessages() is called — addEventListener alone leaves them queued
+  // forever. So every "can I reload you?" went unanswered, the worker read the
+  // silence as "an old bundle with no session to lose", and navigated tabs that
+  // were mid-load or in a game.
+  navigator.serviceWorker.startMessages()
+
   navigator.serviceWorker.addEventListener('message', (event: MessageEvent) => {
     if (event.data?.type !== 'MWC_CAN_RELOAD') return
     const port = event.ports?.[0]

@@ -122,11 +122,21 @@ self.addEventListener('activate', (event) => {
         return
       }
 
-      // A busy client reloads itself when the game ends; see serviceWorker.ts.
       if (reply && reply.busy) {
-        log('client is in a game; it will reload itself when the game ends', client.url)
+        log('client is busy; leaving it alone', client.url)
         return
       }
+
+      // No answer means a bundle that predates this protocol. Every proxy in
+      // production requires the resume handshake, so such a bundle cannot hold a
+      // session — it is refused at the handshake — and therefore has no game to
+      // interrupt. That is precisely the client worth replacing, and navigating
+      // it is the whole point of this sweep.
+      //
+      // What made this dangerous before was not the rule but a broken reply
+      // path: navigator.serviceWorker.startMessages() was never called, so *no*
+      // client could answer and every one of them looked old. The rule is only
+      // as safe as the channel it depends on.
       try {
         log('navigating', client.url)
         await client.navigate(client.url)
