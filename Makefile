@@ -1,3 +1,4 @@
+#
 TAG := $(shell git describe --tags --exact-match 2>/dev/null)
 
 all:
