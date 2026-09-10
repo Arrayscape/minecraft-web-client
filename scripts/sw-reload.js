@@ -105,6 +105,24 @@ self.addEventListener('activate', (event) => {
     log(`found ${clients.length} window client(s)`)
 
     await Promise.all(clients.map(async (client) => {
+      // Only tabs the user is actually looking at.
+      //
+      // Navigating a background tab is not free: same-origin tabs share a
+      // renderer process, so reloading one runs a full app startup — atlas
+      // generation, workers, asset decoding — on the same main thread as a game
+      // running in another tab. Measured effect: framerate into the 20s, chunk
+      // meshing stalling, and disconnect's location.reload() taking seconds.
+      // The tab being repaired was not even the one that suffered.
+      //
+      // A hidden stale tab costs nothing by staying stale: it cannot hold a
+      // session against a proxy that requires the resume handshake, and it will
+      // be caught by a later activation once it is visible, or by any navigation
+      // of its own.
+      if (client.visibilityState && client.visibilityState !== 'visible') {
+        log('client is in the background; leaving it alone', client.url)
+        return
+      }
+
       let reply
       try {
         reply = await askClient(client)
