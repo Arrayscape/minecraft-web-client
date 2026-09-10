@@ -39,12 +39,12 @@ export const listenForReloadRequests = () => {
     if (event.data?.type !== 'MWC_CAN_RELOAD') return
     const port = event.ports?.[0]
     if (!port) return
-    if (miscUiState.gameLoaded) {
-      port.postMessage('busy')
-      reloadWhenGameEnds()
-    } else {
-      port.postMessage('idle')
-    }
+    // The version is what lets the worker tell "this page is stale" from "this
+    // page is already what I am installing" — without it the sweep reloads a
+    // perfectly current tab on every fresh registration.
+    const busy = miscUiState.gameLoaded
+    port.postMessage({ busy, version: process.env.BUILD_VERSION })
+    if (busy) reloadWhenGameEnds()
   })
 }
 

@@ -306,7 +306,12 @@ const appConfig = defineConfig({
                         } else {
                             if (!disableServiceWorker) {
                             // The worker imports this; it has to exist next to it.
-                            fs.copyFileSync('./scripts/sw-reload.js', './dist/sw-reload.js')
+                            // Stamp the build version in so the sweep can recognise a
+                            // client that is already running this build.
+                            fs.writeFileSync('./dist/sw-reload.js',
+                                fs.readFileSync('./scripts/sw-reload.js', 'utf8')
+                                    .replace('__MWC_BUILD_VERSION__', buildingVersion),
+                                'utf8')
                             const { count, size, warnings } = await generateSW({
                                     // dontCacheBustURLsMatching: [new RegExp('...')],
                                     globDirectory: 'dist',

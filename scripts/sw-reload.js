@@ -31,6 +31,10 @@ const ASK_TIMEOUT_MS = 2000
 // a dead one does not strand the player on a blank page.
 const NAVIGATION_TIMEOUT_MS = 4000
 
+// Substituted at build time (see rsbuild.config.ts). Lets the sweep below tell a
+// client that is merely uncontrolled from one that is actually out of date.
+const BUILD_VERSION = '__MWC_BUILD_VERSION__'
+
 // This worker decides, on its own, to navigate someone's tab. When it declines
 // to, or fails to, that has to be visible: the first attempt swallowed every
 // error and left no way to tell "never activated" from "activated and found no
@@ -41,7 +45,7 @@ const log = (...args) => {
   } catch { /* console may be gone during teardown */ }
 }
 
-const askIfBusy = async (client) => {
+const askClient = async (client) => {
   return new Promise(resolve => {
     let settled = false
     const finish = (busy) => {
@@ -53,15 +57,15 @@ const askIfBusy = async (client) => {
     let channel
     try {
       channel = new MessageChannel()
-      channel.port1.onmessage = (event) => { finish(event.data === 'busy') }
+      channel.port1.onmessage = (event) => { finish(event.data) }
       client.postMessage({ type: 'MWC_CAN_RELOAD' }, [channel.port2])
     } catch (err) {
       log('cannot ask client; treating as old bundle', err)
-      finish(false) // see the note above on what silence means
+      finish(undefined) // see the note above on what silence means
       return
     }
 
-    setTimeout(() => { finish(false) }, ASK_TIMEOUT_MS)
+    setTimeout(() => { finish(undefined) }, ASK_TIMEOUT_MS)
   })
 }
 
@@ -149,15 +153,25 @@ self.addEventListener('activate', (event) => {
     log(`found ${clients.length} window client(s)`)
 
     await Promise.all(clients.map(async (client) => {
-      let busy = false
+      let reply
       try {
-        busy = await askIfBusy(client)
+        reply = await askClient(client)
       } catch (err) {
         log('ask failed; treating as old bundle', err)
-        busy = false
+        reply = undefined
       }
+
+      // Already running what this worker is here to install. Navigating it would
+      // reload a page for no reason — which is what the first version of this
+      // did on every fresh registration, including a user's very first visit,
+      // where there is by definition nothing stale to replace.
+      if (reply && reply.version && reply.version === BUILD_VERSION) {
+        log('client is already current; leaving it alone', client.url)
+        return
+      }
+
       // A busy client reloads itself when the game ends; see serviceWorker.ts.
-      if (busy) {
+      if (reply && reply.busy) {
         log('client is in a game; it will reload itself when the game ends', client.url)
         return
       }
