@@ -97,7 +97,17 @@ export default () => {
 
   let pingId = 0
   bot.pingServer = async () => {
-    if (versionToNumber(bot.version) < versionToNumber('1.20.2')) return bot.player?.ping ?? -1
+    // Below 1.20.2 there is no ping_request packet, so there is no way to time a
+    // round trip from here. What comes back instead is the server's own
+    // player-list figure: coarse, delayed, and measured by someone else. It is
+    // reported so callers can say so rather than passing it off as a round trip
+    // — it can and does read lower than legs we timed ourselves, which is how a
+    // "total" ended up below one of its own parts on screen.
+    if (versionToNumber(bot.version) < versionToNumber('1.20.2')) {
+      bot.pingServerIsReported = true
+      return bot.player?.ping ?? -1
+    }
+    bot.pingServerIsReported = false
     return new Promise<number>((resolve) => {
       const curId = pingId++
       bot._client.write('ping_request', { id: BigInt(curId) })
@@ -131,5 +141,7 @@ declare module 'mineflayer' {
   interface Bot {
     pingProxy: () => Promise<number>
     pingServer: () => Promise<number | undefined>
+    /** True when pingServer returned the server's own figure rather than a round trip we timed. */
+    pingServerIsReported?: boolean
   }
 }

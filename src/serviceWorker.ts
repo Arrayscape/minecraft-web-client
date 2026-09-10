@@ -1,25 +1,6 @@
 import { subscribe } from 'valtio'
 import { isCypress } from './standaloneUtils'
-import { miscUiState } from './globalState'
-
-let reloadArmed = false
-
-/**
- * Reload once the player is out of the game.
- *
- * The worker asked to navigate this tab and we said no because a session was
- * running. That answer has to come with a promise to do it later, or a player
- * who stays in one game keeps the superseded bundle indefinitely.
- */
-const reloadWhenGameEnds = () => {
-  if (reloadArmed) return
-  reloadArmed = true
-  const stop = subscribe(miscUiState, () => {
-    if (miscUiState.gameLoaded) return
-    stop()
-    location.reload()
-  })
-}
+import { activeModalStack, miscUiState } from './globalState'
 
 /**
  * Answer the service worker when it asks whether this tab can be navigated.
@@ -32,6 +13,11 @@ const reloadWhenGameEnds = () => {
  * Not answering is itself an answer: it means a bundle older than this protocol,
  * which cannot hold a session against a proxy that requires the resume
  * handshake, so it has no game to lose.
+ *
+ * A busy tab is simply left alone. It used to promise to reload itself once the
+ * game ended, which raced disconnect()'s own location.reload() — two navigations
+ * for one click. It picks up the new build on its next navigation like anything
+ * else.
  */
 export const listenForReloadRequests = () => {
   if (!('serviceWorker' in navigator)) return
@@ -39,12 +25,18 @@ export const listenForReloadRequests = () => {
     if (event.data?.type !== 'MWC_CAN_RELOAD') return
     const port = event.ports?.[0]
     if (!port) return
-    // The version is what lets the worker tell "this page is stale" from "this
-    // page is already what I am installing" — without it the sweep reloads a
-    // perfectly current tab on every fresh registration.
-    const busy = miscUiState.gameLoaded
+    // "Busy" cannot mean only "in a game". gameLoaded is set *after* chunks
+    // finish (index.ts, following waitForChunks), so a player who is connecting
+    // — the worst possible moment to navigate — reports itself idle. Reloading
+    // them there is what left the world blank with the chunk progress stuck at
+    // 0%: the page was thrown away mid-load.
+    //
+    // Anything on the modal stack counts, which includes the app-status screen
+    // shown throughout connecting and loading. Only a bare main menu is safe.
+    const busy = miscUiState.gameLoaded || activeModalStack.length > 0
+    // The version lets the worker tell "this page is stale" from "this page is
+    // already what I am installing", so a current tab is never reloaded at all.
     port.postMessage({ busy, version: process.env.BUILD_VERSION })
-    if (busy) reloadWhenGameEnds()
   })
 }
 

@@ -76,8 +76,17 @@ export default () => {
   // moments, so the subtraction can go negative — which it visibly did, showing
   // "-42ms" for a leg that cannot be less than zero. A number that cannot be
   // derived is better shown as unknown than as a confident absurdity.
-  const derivedLeg = pingTotal === null || proxyPing === null ? null : pingTotal - proxyPing
+  // Only a figure we timed ourselves can be decomposed. The server-reported one
+  // is somebody else's measurement of a different thing, so subtracting our
+  // proxy leg from it is meaningless — that is how "-42ms" happened, and why a
+  // 43ms "total" could sit under a measured 60ms leg.
+  const isReported = bot.pingServerIsReported === true
+  const derivedLeg = isReported || pingTotal === null || proxyPing === null ? null : pingTotal - proxyPing
   const remainingLeg = pingTotal === null ? '...' : (derivedLeg === null || derivedLeg < 0 ? '?' : `${derivedLeg}ms`)
+  const totalLabel = isReported ? 'Server-reported ping' : 'Ping'
+  const totalHint = isReported
+    ? `The server's own figure — this Minecraft version (${bot.version}) has no packet to time a round trip with, so it cannot be compared with the measured legs above.`
+    : undefined
 
   const ICON_SIZE = 18
 
@@ -105,7 +114,7 @@ export default () => {
       </span>
       <span className={styles.dataRow}>{serverIp}</span>
 
-      <span className={styles.totalRow}>Ping: {pingTotal || '?'}ms</span>
+      <span className={styles.totalRow} title={totalHint}>{totalLabel}: {pingTotal || '?'}ms</span>
     </div>
   )
 }
