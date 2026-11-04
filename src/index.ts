@@ -17,7 +17,7 @@ import './mineflayer/timers'
 import './mineflayer/plugins'
 import './app/progressControllers'
 import './app/gamepadCursor'
-import { getServerInfo } from './mineflayer/mc-protocol'
+import { getServerInfo, getServerInfoViaProxy } from './mineflayer/mc-protocol'
 import { resumeEvents } from './mineflayer/resumableSocket'
 import { onGameLoad } from './inventoryWindows'
 import initCollisionShapes from './getCollisionInteractionShapes'
@@ -317,20 +317,24 @@ export async function connect (connectOptions: ConnectOptions) {
 
   let clientDataStream: Duplex | undefined
 
+  // Magic-link mode: the proxy refuses any /connect that doesn't name a live
+  // magic session, and net-browserify's body is
+  // fixed to {host, port}, so the session id rides on a header. setProxy
+  // keeps this object by reference and reads it per request, so the id is
+  // written in once auth produces it — see bindMagicSession below.
+  let proxyHeaders: Record<string, string> | undefined
   if (connectOptions.server && !connectOptions.viewerWsConnect && !parsedServer.isWebSocket) {
     console.log(`using proxy ${proxy.host}:${proxy.port || location.port}`)
-    const proxyHeaders: Record<string, string> = {
+    proxyHeaders = {
       Authorization: `Bearer ${new URLSearchParams(location.search).get('token') ?? ''}`,
-    }
-    // Magic-link mode: pass the server-side session id via header so /connect
-    // can bind the new TCP connection to the MagicSession. net-browserify's
-    // body is fixed to {host, port}, so we ride on a custom header.
-    const magicState = magicLinkMode.get()
-    if (magicState?.proxySessionId) {
-      proxyHeaders['X-Proxy-Session-Id'] = magicState.proxySessionId
     }
     net['setProxy']({ hostname: proxy.host, port: proxy.port, headers: proxyHeaders, artificialDelay: appQueryParams.addPing ? Number(appQueryParams.addPing) : undefined })
   }
+  const bindMagicSession = () => {
+    const id = magicLinkMode.get()?.proxySessionId
+    if (id && proxyHeaders) proxyHeaders['X-Proxy-Session-Id'] = id
+  }
+  bindMagicSession()
 
   const renderDistance = singleplayer ? renderDistanceSingleplayer : multiplayerRenderDistance
   let updateDataAfterJoin = () => { }
@@ -457,6 +461,37 @@ export async function connect (connectOptions: ConnectOptions) {
     }
 
     if (connectOptions.authenticatedAccount) username = 'you'
+
+    let newTokensCacheResult = null as any
+    const cachedTokens = typeof connectOptions.authenticatedAccount === 'object' ? connectOptions.authenticatedAccount.cachedTokens : {}
+    let authData: Awaited<ReturnType<typeof microsoftAuthflow>> | undefined
+    const authenticate = async () => {
+      if (!connectOptions.authenticatedAccount) return
+      authData = await microsoftAuthflow({
+        tokenCaches: cachedTokens,
+        proxyBaseUrl: connectOptions.proxy,
+        setProgressText (text) {
+          progress.setMessage(text)
+        },
+        setCacheResult (result) {
+          newTokensCacheResult = result
+        },
+        connectingServer: server.host
+      })
+      if (magicLinkMode.isActive()) {
+        // microsoftAuthflow only resolves endpoints; the proxy's /auth (which
+        // creates the magic session) runs in getMinecraftJavaToken, normally
+        // from mineflayer's auth hook after the version probe. Run it now and
+        // hand mineflayer the same result so it doesn't open a second session.
+        const token = await authData.authFlow.getMinecraftJavaToken()
+        authData.authFlow.getMinecraftJavaToken = async () => token
+      }
+      bindMagicSession()
+    }
+    // The proxy answers the version ping from a live magic session.
+    const authFirst = magicLinkMode.isActive()
+    if (authFirst) await authenticate()
+
     let initialLoadingText: string
     if (singleplayer) {
       initialLoadingText = 'Local server is still starting'
@@ -467,7 +502,11 @@ export async function connect (connectOptions: ConnectOptions) {
         const versionAutoSelect = getVersionAutoSelect()
         const wrapped = createWrappedProgressReporter(progress, `Fetching server version. Preffered: ${versionAutoSelect}`)
         loadingTimerState.networkOnlyStart = Date.now()
-        const autoVersionSelect = await getServerInfo(server.host, server.port ? Number(server.port) : undefined, versionAutoSelect)
+        const port = server.port ? Number(server.port) : undefined
+        const magic = magicLinkMode.get()
+        const autoVersionSelect = magic
+          ? await getServerInfoViaProxy(connectOptions.proxy!, magic.code, server.host, port, versionAutoSelect)
+          : await getServerInfo(server.host, port, versionAutoSelect)
         wrapped.end()
         finalVersion = autoVersionSelect.version
       }
@@ -486,22 +525,7 @@ export async function connect (connectOptions: ConnectOptions) {
       clientDataStream = (await getWebsocketStream(server.host)).mineflayerStream
     }
 
-    let newTokensCacheResult = null as any
-    const cachedTokens = typeof connectOptions.authenticatedAccount === 'object' ? connectOptions.authenticatedAccount.cachedTokens : {}
-    let authData: Awaited<ReturnType<typeof microsoftAuthflow>> | undefined
-    if (connectOptions.authenticatedAccount) {
-      authData = await microsoftAuthflow({
-        tokenCaches: cachedTokens,
-        proxyBaseUrl: connectOptions.proxy,
-        setProgressText (text) {
-          progress.setMessage(text)
-        },
-        setCacheResult (result) {
-          newTokensCacheResult = result
-        },
-        connectingServer: server.host
-      })
-    }
+    if (!authFirst) await authenticate()
 
     if (p2pMultiplayer) {
       clientDataStream = await connectToPeer(connectOptions.peerId!, connectOptions.peerOptions)

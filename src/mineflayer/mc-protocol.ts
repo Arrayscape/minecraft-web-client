@@ -1,5 +1,6 @@
 import net from 'net'
 import { Client } from 'minecraft-protocol'
+import { versionsByMinecraftVersion, postNettyVersionsByProtocolVersion } from 'minecraft-data'
 import { appQueryParams } from '../appParams'
 import { downloadAllMinecraftData, getVersionAutoSelect } from '../connect'
 import { gameAdditionalState } from '../globalState'
@@ -7,6 +8,7 @@ import { ProgressReporter } from '../core/progressReporter'
 import { parseServerAddress } from '../parseServerAddress'
 import { getCurrentProxy } from '../react/ServersList'
 import { pingServerVersion, validatePacket } from './minecraft-protocol-extra'
+import { UserError } from './userError'
 import { getWebsocketStream } from './websocket-core'
 
 let lastPacketTime = 0
@@ -93,6 +95,42 @@ export const getServerInfo = async (ip: string, port?: number, preferredVersion 
   }).finally(() => {
     window.setLoadingMessage = undefined
   })
+}
+
+// Magic-link mode: the proxy runs the status ping itself and answers for the
+// servers its session's batch names — the proxy only lets a session open one
+// TCP connection to log in on, and a status ping can't be followed by a login
+// on the same connection.
+//
+// The preferred version's protocol goes in the ping's Handshake, as
+// minecraft-protocol's own ping does: a multi-version server (Velocity,
+// ViaVersion) answers with it when it can serve it, and with its own newest
+// otherwise. The version is then taken from the reply's protocol number only —
+// a branded name like "Velocity 1.7.2-26.2" carries the software's version,
+// not Minecraft's, so guessing from it picks nonsense.
+export const getServerInfoViaProxy = async (proxyBaseUrl: string, magicCode: string, host: string, port = 25_565, preferredVersion = getVersionAutoSelect()) => {
+  await downloadAllMinecraftData()
+  if (!proxyBaseUrl.startsWith('http')) proxyBaseUrl = `${location.protocol === 'http:' ? 'http' : 'https'}://${proxyBaseUrl}`
+  const preferredProtocol = preferredVersion ? versionsByMinecraftVersion.pc[preferredVersion]?.version : undefined
+  const resp = await fetch(`${proxyBaseUrl}/api/vm/net/ping`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ magicCode, protocol: preferredProtocol }),
+  })
+  if (!resp.ok) throw new Error(`Cannot ping server [${resp.status}]: ${await resp.text()}`)
+  const { servers } = await resp.json() as { servers: Array<{ host: string, port: number, status?: any, error?: string }> }
+  const entry = servers.find(s => s.host.toLowerCase() === host.toLowerCase() && s.port === port)
+  if (!entry) throw new Error(`${host}:${port} is not one of this magic link's servers`)
+  if (!entry.status) throw new Error(`Server ${host}:${port}: ${entry.error ?? 'no response'}`)
+
+  const { name, protocol } = entry.status.version ?? {}
+  // The typings say one version per protocol; at runtime it's a list.
+  const byProtocol = postNettyVersionsByProtocolVersion.pc as unknown as Record<number, Array<{ minecraftVersion: string }>>
+  const known = byProtocol[protocol]
+  if (!known?.length) {
+    throw new UserError(`Server ${host}:${port} runs ${name ?? 'an unknown version'} (protocol ${protocol}), which this client doesn't support`)
+  }
+  return { version: known[0].minecraftVersion, latency: 0, fullInfo: entry.status }
 }
 
 globalThis.debugTestPing = async (ip: string) => {
