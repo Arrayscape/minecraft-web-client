@@ -216,7 +216,7 @@ const appConfig = defineConfig({
                 target: process.env.MAGIC_LINK_BACKEND || 'https://mcplaydates.com',
                 changeOrigin: true,
             },
-            '/api': 'http://localhost:8080',
+            '/api': `http://localhost:${process.env.DEV_PROXY_PORT || 8080}`,
         },
     },
     plugins: [
